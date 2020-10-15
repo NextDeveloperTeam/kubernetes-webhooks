@@ -1,0 +1,219 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    docker-proxy-webhook: disabled
+  name: docker-proxy
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: docker-proxy-config
+  namespace: docker-proxy
+data:
+  docker-proxy-config.yaml: |
+    ignoreList:
+    - "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+    domainMap:
+      docker.io: org-name-docker-io.jfrog.io
+      quay.io: org-name-quay-io.jfrog.io
+      gcr.io: org-name-gcr-io.jfrog.io
+      k8s.gcr.io: org-name-k8s-gcr-io.jfrog.io
+      us.gcr.io: org-name
+      docker.elastic.co: org-name-docker-elastic-co.jfrog.io
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: docker-proxy-webhook-certificate
+  namespace: docker-proxy
+spec:
+  secretName: docker-proxy-webhook-certificate
+  duration: 8760h # 365d
+  renewBefore: 360h # 15d
+  subject:
+    organizations:
+      - nexttrucking
+  isCA: false
+  privateKey:
+    size: 2048
+    algorithm: RSA
+    encoding: PKCS1
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - docker-proxy-webhook.docker-proxy.svc
+  issuerRef:
+    name: ca-cluster-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: docker-proxy-webhook
+  name: docker-proxy-webhook
+  namespace: docker-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: docker-proxy-webhook
+  template:
+    metadata:
+      labels:
+        app: docker-proxy-webhook
+    spec:
+      affinity:
+        podAntiAffinity:
+          # do not schedule on the same node to avoid `hostNetwork` port conflicts
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: "kubernetes.io/hostname"
+            labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - docker-proxy-webhook
+      containers:
+        - name: docker-proxy-webhook
+          args:
+            - -metrics-addr=:18080
+            - -health-addr=:18081
+            - -listen-port=19443
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/registry/docker-proxy
+          imagePullPolicy: Always
+          # Graceful shutdown hack - sleep 15 seconds to give the k8s network
+          # config time to update and stop routing new requests to this pod.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 15
+          ports:
+            - containerPort: 19443
+              protocol: TCP
+              name: https
+            - containerPort: 18080
+              protocol: TCP
+              name: metrics
+            - containerPort: 18081
+              protocol: TCP
+              name: monitoring
+#          resources:
+#            requests:
+#              memory: $REQUESTS_MEMORY
+#              cpu: $REQUESTS_CPU
+#            limits:
+#              memory: $LIMITS_MEMORY
+#              cpu: $LIMITS_CPU
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitoring
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: monitoring
+            successThreshold: 1
+            failureThreshold: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - mountPath: /tmp/k8s-webhook-server/serving-certs
+              name: cert
+              readOnly: true
+            - mountPath: /tmp/config
+              name: docker-proxy-config
+              readOnly: true
+      hostNetwork: true
+      #hostPort: 19443  // does this work in EKS now?
+      volumes:
+        - name: cert
+          secret:
+            defaultMode: 420
+            secretName: docker-proxy-webhook-certificate
+        - name: docker-proxy-config
+          configMap:
+            name: docker-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: docker-proxy-webhook
+  name: docker-proxy-webhook
+  namespace: docker-proxy
+spec:
+  ports:
+    - name: https
+      port: 443  # must use 443 with our setup: https://github.com/kubernetes/kubernetes/issues/94889
+      protocol: TCP
+      targetPort: https
+    - name: metrics
+      port: 8080
+      protocol: TCP
+      targetPort: metrics
+    - name: monitoring
+      port: 8081
+      protocol: TCP
+      targetPort: monitoring
+  selector:
+    app: docker-proxy-webhook
+  type: ClusterIP
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: docker-proxy-webhook
+  namespace: docker-proxy
+  annotations:
+    cert-manager.io/inject-ca-from: docker-proxy/docker-proxy-webhook-certificate
+webhooks:
+  - name: docker-proxy-webhook.nexttrucking.com
+    namespaceSelector:
+      matchExpressions:
+        - key: docker-proxy-webhook
+          operator: NotIn
+          values:
+            - disabled
+    rules:
+      - apiGroups:   [""]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["pods"]
+        scope:       "*"
+    clientConfig:
+      service:
+        namespace: docker-proxy
+        name: docker-proxy-webhook
+        path: /mutate
+        port: 443
+    # TODO: come back and add `"v1"` once this is resolved: https://github.com/kubernetes-sigs/controller-runtime/issues/1161
+    admissionReviewVersions: ["v1beta1"]
+    sideEffects: None
+    matchPolicy: Equivalent
+    reinvocationPolicy: IfNeeded
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app: docker-proxy-webhook
+  name: docker-proxy-webhook
+  namespace: docker-proxy
+spec:
+  endpoints:
+  - port: metrics
+  selector:
+    matchLabels:
+      app: docker-proxy-webhook
+  namespaceSelector:
+    matchNames:
+    - docker-proxy

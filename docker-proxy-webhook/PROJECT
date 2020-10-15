@@ -1,0 +1,3 @@
+domain: k8s.nexttrucking.com
+repo: github.com/NextDeveloperTeam/docker-proxy-webhook
+version: "2"
