@@ -17,6 +17,8 @@ jobs:
         command: |
           cd docker-proxy-webhook
 
+          make test
+
           docker build . -t $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1
           docker tag $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1 $DOCKER_REPO_URL/docker-proxy-webhook:latest
 
