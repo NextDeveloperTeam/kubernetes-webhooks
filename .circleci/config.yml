@@ -19,15 +19,17 @@ jobs:
 
           make test
 
-          docker build . -t $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1
-          docker tag $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1 $DOCKER_REPO_URL/docker-proxy-webhook:latest
+          # only publish from `main`
+          if [[ ${CIRCLE_BRANCH} = main ]]; then
+            docker build . -t $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1
+            docker tag $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1 $DOCKER_REPO_URL/docker-proxy-webhook:latest
 
-          aws ecr get-login-password | docker login --username AWS --password-stdin ${DOCKER_REPO_URL%/*}
-          docker push $DOCKER_REPO_URL/docker-proxy-webhook
+            aws ecr get-login-password | docker login --username AWS --password-stdin ${DOCKER_REPO_URL%/*}
+            docker push $DOCKER_REPO_URL/docker-proxy-webhook
+          fi
 workflows:
   version: 2
   build:
     jobs:
     - build:
         context: next-platform-build
-
