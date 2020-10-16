@@ -1,0 +1,33 @@
+version: 2.1
+orbs:
+  aws-cli: circleci/aws-cli@1.3.0
+jobs:
+  build:
+    executor: aws-cli/default
+    working_directory: ~/repo
+    docker:
+    - image: circleci/golang:1.15
+    steps:
+    - setup_remote_docker:
+        version: 19.03.13
+    - checkout
+    - aws-cli/setup
+    - run:
+        name: Build
+        command: |
+          cd docker-proxy-webhook
+
+          make test
+
+          docker build . -t $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1
+          docker tag $DOCKER_REPO_URL/docker-proxy-webhook:$CIRCLE_SHA1 $DOCKER_REPO_URL/docker-proxy-webhook:latest
+
+          aws ecr get-login-password | docker login --username AWS --password-stdin ${DOCKER_REPO_URL%/*}
+          docker push $DOCKER_REPO_URL/docker-proxy-webhook
+workflows:
+  version: 2
+  build:
+    jobs:
+    - build:
+        context: next-platform-build
+
