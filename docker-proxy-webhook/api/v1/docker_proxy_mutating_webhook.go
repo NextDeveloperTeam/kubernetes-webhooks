@@ -43,7 +43,7 @@ type DockerProxyMutatingWebhook struct {
 }
 
 var (
-	webhookResultCount = prometheus.NewCounterVec(
+	webhookResultCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_result_total",
 			Help: "Number of webhook invocations",
@@ -64,7 +64,7 @@ var (
 		},
 		[]string{"domain", "namespace"},
 	)
-	unknownDomainCount = prometheus.NewCounterVec(
+	unknownDomainCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_unknown_domain_total",
 			Help: "Number of unmapped domains",
@@ -76,7 +76,7 @@ var (
 var log = logf.Log.WithName("docker-proxy-mutating-webhook")
 
 func init() {
-	metrics.Registry.MustRegister(webhookResultCount, webhookFailureCounter, containerRewriteCounter, unknownDomainCount)
+	metrics.Registry.MustRegister(webhookResultCounter, webhookFailureCounter, containerRewriteCounter, unknownDomainCounter)
 }
 
 func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.Client) (*DockerProxyMutatingWebhook, error) {
@@ -171,10 +171,10 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	}
 
 	if changed {
-		webhookResultCount.WithLabelValues("true", req.Namespace).Inc()
+		webhookResultCounter.WithLabelValues("true", req.Namespace).Inc()
 		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 	} else {
-		webhookResultCount.WithLabelValues("false", req.Namespace).Inc()
+		webhookResultCounter.WithLabelValues("false", req.Namespace).Inc()
 		return admission.Allowed("No `image`s rewritten")
 	}
 }
@@ -214,7 +214,7 @@ func RewriteImage(image string, namespace string, config DockerConfig) (string, 
 
 	if newImage == "" {
 		log.V(2).Info("Found unmapped domain", "domain", domain)
-		unknownDomainCount.WithLabelValues(domain, namespace).Inc()
+		unknownDomainCounter.WithLabelValues(domain, namespace).Inc()
 		newImage = domain
 	} else {
 		containerRewriteCounter.WithLabelValues(reference.Domain(named), namespace).Inc()
