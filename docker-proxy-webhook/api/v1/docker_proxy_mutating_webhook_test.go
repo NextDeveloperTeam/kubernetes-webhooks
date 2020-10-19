@@ -69,10 +69,14 @@ func TestRewriteImage(t *testing.T) {
 			Image:    "unmapped-domain.com/registry/repo",
 			Expected: "unmapped-domain.com/registry/repo",
 		},
+		{
+			Image:    "org-name-docker-io.jfrog.io/already-mapped-domain/test",
+			Expected: "org-name-docker-io.jfrog.io/already-mapped-domain/test",
+		},
 	}
 
 	for _, tcase := range tcases {
-		img, err := RewriteImage(tcase.Image, config)
+		img, err := RewriteImage(tcase.Image, "my_namespace", config)
 		if err != nil {
 			t.Errorf("Expected: %v. Got error: %v", tcase.Expected, err)
 		} else if img != tcase.Expected {
@@ -81,7 +85,7 @@ func TestRewriteImage(t *testing.T) {
 	}
 
 	// another test case for err != nil
-	img, err := RewriteImage("INVALID-UPPERCASE-REPO", config)
+	img, err := RewriteImage("INVALID-UPPERCASE-REPO", "my_namespace", config)
 	if err == nil {
 		t.Errorf("Expected error. Got: %v", img)
 	}
