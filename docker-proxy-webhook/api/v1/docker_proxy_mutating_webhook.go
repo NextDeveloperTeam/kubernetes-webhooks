@@ -110,55 +110,6 @@ func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.C
 
 // TODO: add _validating_ webhook to catch cases where the order of operations leads to non-conforming request
 
-func RewriteImage(image string, namespace string, config DockerConfig) (string, error) {
-	named, err := reference.ParseNormalizedNamed(image)
-	if err != nil {
-		log.Error(err, "unable to parse image", "image", image)
-		return "", err
-	}
-
-	newImage := ""
-	domain := strings.ToLower(reference.Domain(named))
-
-	// Check if the domain matches a mapped domain value.
-	// If so, it's already conforming & valid and does not need rewriting.
-	for _, val := range config.DomainMap {
-		if val == domain {
-			return image, nil
-		}
-	}
-
-	if val, ok := config.DomainMap[domain]; ok {
-		newImage = val
-	}
-
-	// Note: behaviour is unspecified if the domain appears in both the `DomainMap` and `IgnoreList`
-	if config.IgnoreList != nil {
-		for _, ignore := range config.IgnoreList {
-			if domain == ignore {
-				newImage = domain
-				break
-			}
-		}
-	}
-
-	if newImage == "" {
-		log.V(2).Info("Found unmapped domain", "domain", domain)
-		unknownDomainCount.WithLabelValues(domain, namespace).Inc()
-		newImage = domain
-	}
-
-	containerRewriteCounter.WithLabelValues(reference.Domain(named), namespace).Inc()
-
-	newImage += "/" + reference.Path(named)
-
-	if t, ok := named.(reference.NamedTagged); ok {
-		newImage += ":" + t.Tag()
-	}
-
-	return newImage, nil
-}
-
 func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
 	log.V(1).Info("mutating pod")
 
@@ -227,6 +178,57 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 		return admission.Allowed("No `image`s rewritten")
 	}
 }
+
+
+func RewriteImage(image string, namespace string, config DockerConfig) (string, error) {
+	named, err := reference.ParseNormalizedNamed(image)
+	if err != nil {
+		log.Error(err, "unable to parse image", "image", image)
+		return "", err
+	}
+
+	newImage := ""
+	domain := strings.ToLower(reference.Domain(named))
+
+	// Check if the domain matches a mapped domain value.
+	// If so, it's already conforming & valid and does not need rewriting.
+	for _, val := range config.DomainMap {
+		if val == domain {
+			return image, nil
+		}
+	}
+
+	if val, ok := config.DomainMap[domain]; ok {
+		newImage = val
+	}
+
+	// Note: behaviour is unspecified if the domain appears in both the `DomainMap` and `IgnoreList`
+	if config.IgnoreList != nil {
+		for _, ignore := range config.IgnoreList {
+			if domain == ignore {
+				newImage = domain
+				break
+			}
+		}
+	}
+
+	if newImage == "" {
+		log.V(2).Info("Found unmapped domain", "domain", domain)
+		unknownDomainCount.WithLabelValues(domain, namespace).Inc()
+		newImage = domain
+	}
+
+	containerRewriteCounter.WithLabelValues(reference.Domain(named), namespace).Inc()
+
+	newImage += "/" + reference.Path(named)
+
+	if t, ok := named.(reference.NamedTagged); ok {
+		newImage += ":" + t.Tag()
+	}
+
+	return newImage, nil
+}
+
 
 func (webhook *DockerProxyMutatingWebhook) InjectDecoder(decoder *admission.Decoder) error {
 	webhook.decoder = decoder
