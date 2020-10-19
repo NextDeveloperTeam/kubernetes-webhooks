@@ -216,9 +216,9 @@ func RewriteImage(image string, namespace string, config DockerConfig) (string, 
 		log.V(2).Info("Found unmapped domain", "domain", domain)
 		unknownDomainCount.WithLabelValues(domain, namespace).Inc()
 		newImage = domain
+	} else {
+		containerRewriteCounter.WithLabelValues(reference.Domain(named), namespace).Inc()
 	}
-
-	containerRewriteCounter.WithLabelValues(reference.Domain(named), namespace).Inc()
 
 	newImage += "/" + reference.Path(named)
 
