@@ -43,40 +43,40 @@ type DockerProxyMutatingWebhook struct {
 }
 
 var (
-	webhookResultCount = prometheus.NewCounterVec(
+	webhookResultCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_result_total",
 			Help: "Number of webhook invocations",
 		},
-		[]string{"mutated"},
+		[]string{"mutated", "pod_namespace"},
 	)
 	webhookFailureCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_failures_total",
 			Help: "Number of webhook failures'",
 		},
-		[]string{"failure_reason"},
+		[]string{"failure_reason", "pod_namespace"},
 	)
 	containerRewriteCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_container_rewrites_total",
 			Help: "Number of container image values rewritten",
 		},
-		[]string{"domain"},
+		[]string{"domain", "pod_namespace"},
 	)
-	unknownDomainCount = prometheus.NewCounterVec(
+	unknownDomainCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "docker_proxy_webhook_unknown_domain_total",
+			Name: "docker_proxy_mutating_webhook_unknown_domain_total",
 			Help: "Number of unmapped domains",
 		},
-		[]string{"domain"})
+		[]string{"domain", "pod_namespace"})
 )
 
 // log is for logging in this package.
 var log = logf.Log.WithName("docker-proxy-mutating-webhook")
 
 func init() {
-	metrics.Registry.MustRegister(webhookResultCount, webhookFailureCounter, containerRewriteCounter, unknownDomainCount)
+	metrics.Registry.MustRegister(webhookResultCounter, webhookFailureCounter, containerRewriteCounter, unknownDomainCounter)
 }
 
 func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.Client) (*DockerProxyMutatingWebhook, error) {
@@ -114,7 +114,7 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	log.V(1).Info("mutating pod")
 
 	if req.Resource.Resource != "pods" {
-		webhookFailureCounter.WithLabelValues("invalid_resource_type")
+		webhookFailureCounter.WithLabelValues("invalid_resource_type", req.Namespace).Inc()
 
 		err := errors.New("expect resource to be pods")
 		logf.Log.Error(err, err.Error())
@@ -125,7 +125,7 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 
 	err := webhook.decoder.Decode(req, pod)
 	if err != nil {
-		webhookFailureCounter.WithLabelValues("decode_error")
+		webhookFailureCounter.WithLabelValues("decode_error", req.Namespace).Inc()
 
 		log.Error(err, "failed to decode pod")
 		return admission.Errored(http.StatusBadRequest, err)
@@ -142,15 +142,15 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	}
 
 	for _, container := range containers {
-		newImage, err := RewriteImage(container.Image, webhook.config)
+		newImage, err := RewriteImage(container.Image, req.Namespace, webhook.config)
 		if err != nil {
-			webhookFailureCounter.WithLabelValues("rewrite_failed")
+			webhookFailureCounter.WithLabelValues("rewrite_failed", req.Namespace).Inc()
 
 			log.Error(err, err.Error())
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
 		if newImage != container.Image {
-			log.V(1).Info("Rewriting image", "oldImage", container.Image, "newImage", newImage)
+			log.V(1).Info("Rewriting image", "oldImage", container.Image, "newImage", newImage, "namespace", req.Namespace)
 			container.Image = newImage
 			changed = true
 		}
@@ -164,22 +164,23 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
-		webhookFailureCounter.WithLabelValues("marshaling_failed")
+		webhookFailureCounter.WithLabelValues("marshaling_failed", req.Namespace).Inc()
 
 		log.Error(err, err.Error())
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
 	if changed {
-		webhookResultCount.WithLabelValues("true").Inc()
+		webhookResultCounter.WithLabelValues("true", req.Namespace).Inc()
 		return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 	} else {
-		webhookResultCount.WithLabelValues("false").Inc()
+		webhookResultCounter.WithLabelValues("false", req.Namespace).Inc()
 		return admission.Allowed("No `image`s rewritten")
 	}
 }
 
-func RewriteImage(image string, config DockerConfig) (string, error) {
+
+func RewriteImage(image string, namespace string, config DockerConfig) (string, error) {
 	named, err := reference.ParseNormalizedNamed(image)
 	if err != nil {
 		log.Error(err, "unable to parse image", "image", image)
@@ -188,6 +189,14 @@ func RewriteImage(image string, config DockerConfig) (string, error) {
 
 	newImage := ""
 	domain := strings.ToLower(reference.Domain(named))
+
+	// Check if the domain matches a mapped domain value.
+	// If so, it's already conforming & valid and does not need rewriting.
+	for _, val := range config.DomainMap {
+		if val == domain {
+			return image, nil
+		}
+	}
 
 	if val, ok := config.DomainMap[domain]; ok {
 		newImage = val
@@ -204,12 +213,12 @@ func RewriteImage(image string, config DockerConfig) (string, error) {
 	}
 
 	if newImage == "" {
-		// unknown repo - log as WARN but allow
-		unknownDomainCount.WithLabelValues(domain)
+		log.V(2).Info("Found unmapped domain", "domain", domain)
+		unknownDomainCounter.WithLabelValues(domain, namespace).Inc()
 		newImage = domain
+	} else {
+		containerRewriteCounter.WithLabelValues(reference.Domain(named), namespace).Inc()
 	}
-
-	containerRewriteCounter.WithLabelValues(reference.Domain(named)).Inc()
 
 	newImage += "/" + reference.Path(named)
 
@@ -219,6 +228,7 @@ func RewriteImage(image string, config DockerConfig) (string, error) {
 
 	return newImage, nil
 }
+
 
 func (webhook *DockerProxyMutatingWebhook) InjectDecoder(decoder *admission.Decoder) error {
 	webhook.decoder = decoder
