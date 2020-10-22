@@ -48,28 +48,28 @@ var (
 			Name: "docker_proxy_mutating_webhook_result_total",
 			Help: "Number of webhook invocations",
 		},
-		[]string{"mutated", "pod_namespace"},
+		[]string{"mutated", "request_namespace"},
 	)
 	webhookFailureCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_failures_total",
 			Help: "Number of webhook failures'",
 		},
-		[]string{"failure_reason", "pod_namespace"},
+		[]string{"failure_reason", "request_namespace"},
 	)
 	containerRewriteCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_container_rewrites_total",
 			Help: "Number of container image values rewritten",
 		},
-		[]string{"domain", "pod_namespace"},
+		[]string{"domain", "request_namespace"},
 	)
 	unknownDomainCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_unknown_domain_total",
 			Help: "Number of unmapped domains",
 		},
-		[]string{"domain", "pod_namespace"})
+		[]string{"domain", "request_namespace"})
 )
 
 // log is for logging in this package.
