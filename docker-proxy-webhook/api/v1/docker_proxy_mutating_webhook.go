@@ -20,15 +20,15 @@ import (
 	"errors"
 	"github.com/docker/distribution/reference"
 	"github.com/prometheus/client_golang/prometheus"
+	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	"net/http"
+	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"strings"
-
-	"gopkg.in/yaml.v2"
 )
 
 type DockerConfig struct {
@@ -43,6 +43,8 @@ type DockerProxyMutatingWebhook struct {
 }
 
 var (
+	anchoredShortIdentifierRegexp = regexp.MustCompile("^" + reference.ShortIdentifierRegexp.String() + "$")
+
 	webhookResultCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "docker_proxy_mutating_webhook_result_total",
@@ -179,8 +181,12 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 	}
 }
 
-
 func RewriteImage(image string, namespace string, config DockerConfig) (string, error) {
+	if anchoredShortIdentifierRegexp.MatchString(image) {
+		// Do not process "identifiers"
+		return image, nil
+	}
+
 	named, err := reference.ParseNormalizedNamed(image)
 	if err != nil {
 		log.Error(err, "unable to parse image", "image", image)
@@ -217,18 +223,21 @@ func RewriteImage(image string, namespace string, config DockerConfig) (string, 
 		unknownDomainCounter.WithLabelValues(domain, namespace).Inc()
 		newImage = domain
 	} else {
-		containerRewriteCounter.WithLabelValues(reference.Domain(named), namespace).Inc()
+		containerRewriteCounter.WithLabelValues(domain, namespace).Inc()
 	}
 
 	newImage += "/" + reference.Path(named)
 
-	if t, ok := named.(reference.NamedTagged); ok {
+	if t, ok := named.(reference.Tagged); ok {
 		newImage += ":" + t.Tag()
+	}
+
+	if d, ok := named.(reference.Digested); ok {
+		newImage += "@" + d.Digest().String()
 	}
 
 	return newImage, nil
 }
-
 
 func (webhook *DockerProxyMutatingWebhook) InjectDecoder(decoder *admission.Decoder) error {
 	webhook.decoder = decoder
