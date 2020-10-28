@@ -73,6 +73,18 @@ func TestRewriteImage(t *testing.T) {
 			Image:    "org-name-docker-io.jfrog.io/already-mapped-domain/test",
 			Expected: "org-name-docker-io.jfrog.io/already-mapped-domain/test",
 		},
+		{
+			Image:    "kubernetes-ingress-controller/nginx-ingress-controller@sha256:b494b781dbe0a164c7954a7ee9c9918ead58455b856045ae6d68c7c96192ac9d",
+			Expected: "org-name-docker-io.jfrog.io/kubernetes-ingress-controller/nginx-ingress-controller@sha256:b494b781dbe0a164c7954a7ee9c9918ead58455b856045ae6d68c7c96192ac9d",
+		},
+		{
+			Image:    "clojure:openjdk-8-lein-2.9.1-alpine@sha256:d5454be246358c9cd683a06108ccdecc8b31a0341e45973af480bef708e8cf1e",
+			Expected: "org-name-docker-io.jfrog.io/library/clojure:openjdk-8-lein-2.9.1-alpine@sha256:d5454be246358c9cd683a06108ccdecc8b31a0341e45973af480bef708e8cf1e",
+		},
+		{
+			Image:    "4a581cd6feb1",
+			Expected: "4a581cd6feb1",
+		},
 	}
 
 	for _, tcase := range tcases {
