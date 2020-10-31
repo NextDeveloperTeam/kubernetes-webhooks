@@ -19,7 +19,8 @@ Dependencies
       depending on the docker-proxy webhook itself).
 - For similar reasons to the above, update all `kube-system` deployments to pull from your docker proxies. Failing to do
   so may result in nodes unable to join the cluster, as CNI, DNS, and/or kube-proxy pods will fail to start if the webhook is not running.
-- In each namespace, create a sufficiently configured docker config secret named `ocker-proxy-credentials`. See: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/ 
+- In each namespace, create a sufficiently configured docker config secret named `docker-proxy-credentials`. See: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/ 
+  - https://github.com/alexellis/registry-creds can help automate this
 
 Deploying
 ---------
@@ -35,10 +36,10 @@ Deploying
 
 TODO
 ----
+[] Clean up TODOs... some of this are done
 [] A few more docs on what this looks like in artifactory
 [] Validating webhook
-  - Record metric if image not rewritten
-  - Somehow validate that the config in the secret contains all registries mapped (or do this on startup/background process (goroutine?))
+[] Record metric if image not rewritten
 [] Test servicemonitor
 [] Set up integration tests
 [] Document metrics + suggested alerts
