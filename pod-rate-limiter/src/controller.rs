@@ -9,6 +9,7 @@ use kube::api::{Api, Meta};
 use kube_runtime::reflector::Store;
 use kube_runtime::utils::try_flatten_touched;
 use kube_runtime::{reflector, watcher};
+use prometheus::Registry;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -48,7 +49,7 @@ pub struct RateLimitingController {
 }
 
 impl RateLimitingController {
-    pub fn new() -> Self {
+    pub fn new(registry: Registry) -> Self {
         Self {
             data: Arc::new(Mutex::new(RateLimitingControllerData {
                 pods_pending_assignment: HashSet::new(),
@@ -389,7 +390,8 @@ mod tests {
         let pod_names: Vec<String> = (1..=3).map(|i| format!("pod-rate-limiter-{}", i)).collect();
         reset_pods(&pod_names).await?;
 
-        let controller = RateLimitingController::new();
+        let registry = prometheus::Registry::default();
+        let controller = RateLimitingController::new(registry.clone());
 
         let client = kube::Client::try_default().await.expect("create client");
         let pods = Api::<Pod>::namespaced(client.clone(), "default");
@@ -414,7 +416,7 @@ mod tests {
         let controller_spawn = controller.clone();
         tokio::spawn(async move { controller_spawn.run().await });
 
-        let mut sleep = 3;
+        let mut sleep = 5;
         let pp = PostParams::default();
 
         for pod_name in &pod_names {
@@ -428,7 +430,7 @@ mod tests {
                 .get_mut(0)
                 .unwrap()
                 .args = Some(vec!["-c".to_string(), format!("sleep {}", sleep)]);
-            sleep += 3;
+            sleep += 5;
 
             match pods.create(&&pp, &pod).await {
                 Err(e) => assert!(false, "pod creation failed {:?}", e),

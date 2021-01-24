@@ -1,3 +1,4 @@
+use actix_web_prom::PrometheusMetrics;
 use actix_web::{get, middleware, post, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use std::path::Path;
@@ -15,7 +16,9 @@ async fn main() -> Result<(), ()> {
     std::env::set_var("RUST_LOG", "actix_web=debug");
     env_logger::init();
 
-    let controller = controller::RateLimitingController::new();
+    let prometheus = PrometheusMetrics::new("api", Some("/metrics"), None);
+
+    let controller = controller::RateLimitingController::new(prometheus.registry.clone());
     let controller_app_data = controller.clone();
 
     let mut server = HttpServer::new(move || {
@@ -26,6 +29,7 @@ async fn main() -> Result<(), ()> {
                     .exclude("/healthz")
                     .exclude("/readyz"),
             )
+            .wrap(prometheus.clone())
             .service(health)
             .service(ready)
             .service(echo)
