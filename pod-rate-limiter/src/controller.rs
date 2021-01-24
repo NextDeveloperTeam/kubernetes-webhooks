@@ -72,8 +72,6 @@ impl RateLimitingController {
 
         println!("Starting event processing loop");
 
-        // add some ability to terminate the loop
-
         loop {
             match pod_stream.try_next().await {
                 Ok(Some(pod)) => {
@@ -378,8 +376,10 @@ pub async fn is_pod_released(
 #[cfg(test)]
 mod tests {
     use crate::controller::RateLimitingController;
+    use anyhow::anyhow;
+    use futures::{StreamExt, TryStreamExt};
     use k8s_openapi::api::core::v1::Pod;
-    use kube::api::{DeleteParams, ListParams, PostParams};
+    use kube::api::{DeleteParams, ListParams, PostParams, WatchEvent};
     use kube::Api;
     use serde_json::json;
     use tokio::time::{delay_for, Duration};
@@ -414,7 +414,7 @@ mod tests {
         let controller_spawn = controller.clone();
         tokio::spawn(async move { controller_spawn.run().await });
 
-        let mut sleep = 5;
+        let mut sleep = 3;
         let pp = PostParams::default();
 
         for pod_name in &pod_names {
@@ -428,52 +428,79 @@ mod tests {
                 .get_mut(0)
                 .unwrap()
                 .args = Some(vec!["-c".to_string(), format!("sleep {}", sleep)]);
-            sleep += 5;
+            sleep += 3;
 
             match pods.create(&&pp, &pod).await {
                 Err(e) => assert!(false, "pod creation failed {:?}", e),
                 _ => (),
             };
-
-            delay_for(Duration::from_millis(100)).await;
         }
 
-        delay_for(Duration::from_millis(3000)).await;
+        delay_for(Duration::from_millis(50)).await;
 
-        // TODO: think more about sequencing and sleeps -> pods need to release in order so that they sleep correctly.
-        //       Maybe we should just give up and run a full actix server and effectively turn this to a full integration test
-        //       which it kind of is ending up as.
-        // t1 - 1 of 3 pods released
-        assert_released(&pod_names, 1, &controller);
-        delay_for(Duration::from_millis(7000)).await;
+        for i in 0..3 {
+            let pod_name = pod_names.get(i).unwrap();
+            assert_released(pod_name, i + 1, &pod_names, &controller);
+            println!("Waiting for ready: {}", pod_name);
+            wait_for_running(pod_name, pods.clone()).await?;
+            println!("Pod is ready");
+        }
 
-        assert_released(&pod_names, 2, &controller);
-        delay_for(Duration::from_millis(7000)).await;
-
-        assert_released(&pod_names, 3, &controller);
         // hard to check `controller.add_pod_pending_assignment()`. Add metrics to verify 3 items hit this list?
         // check any other internal state?
 
         reset_pods(&pod_names).await?;
 
-        // trigger.cancel();
-
         Ok(())
     }
 
-    fn assert_released(
-        pod_names: &Vec<String>,
-        expected: i32,
-        controller: &RateLimitingController,
-    ) {
-        let mut released = 0;
-        for pod_name in pod_names {
-            // ick: hardcoding 'minikube'
-            if controller.is_pod_released("minikube", pod_name.as_str()) {
-                released += 1;
+    async fn wait_for_running(pod_name: &str, pods: Api::<Pod>) -> anyhow::Result<()> {
+        let lp = ListParams::default()
+            .fields(&format!("metadata.name={}", pod_name))
+            .timeout(20);
+        let mut stream = pods.watch(&lp, "0").await?.boxed();
+
+        let mut running = false;
+
+        while let Some(status) = stream.try_next().await? {
+            match status {
+                WatchEvent::Modified(o) => {
+                    let s = o.status.as_ref().expect("status exists on pod");
+                    let phase = s.phase.clone().unwrap_or_default();
+                    if phase == "Running" {
+                        running = true;
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
-        assert_eq!(expected, released);
+
+        match running {
+            true => Ok(()),
+            false => Err(anyhow!("Pod not ready: {}", pod_name))
+        }
+    }
+
+    fn assert_released(
+        released_pod: &str,
+        expected_released_count: usize,
+        pod_names: &Vec<String>,
+        controller: &RateLimitingController,
+    ) {
+        let mut pod_released = false;
+        let mut total_released = 0;
+        for pod_name in pod_names {
+            if controller.is_pod_released("minikube", pod_name.as_str()) {
+                total_released += 1;
+
+                if pod_name == released_pod {
+                    pod_released = true;
+                }
+            }
+        }
+        assert!(pod_released);
+        assert_eq!(expected_released_count, total_released);
     }
 
     async fn reset_pods(pod_names: &Vec<String>) -> anyhow::Result<()> {
