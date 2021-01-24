@@ -1,6 +1,3 @@
-use k8s_openapi::api::core::v1::ObjectFieldSelector;
-use k8s_openapi::api::core::v1::EnvVarSource;
-use k8s_openapi::api::core::v1::EnvVar;
 use actix_web::{post, web, HttpResponse};
 use json_patch::PatchOperation::Add;
 use k8s_openapi::api::authentication::v1::UserInfo;
@@ -8,12 +5,11 @@ use k8s_openapi::api::core::v1::{Container, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use k8s_openapi::apimachinery::pkg::runtime::RawExtension;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 
 #[post("/mutate")]
-pub async fn mutate(
-    admission_request: web::Json<Request>,
-) -> HttpResponse {
+pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
     //println!("{:?}", admission_request);
 
     if admission_request
@@ -50,60 +46,7 @@ pub async fn mutate(
         .find(|c| c.name == "pod-rate-limiter-init")
         .is_none()
     {
-        Some(Container {
-            args: Some(vec![
-                "-c".to_string(),
-                "start=`date +%s`; elapsed=0; released=-1; until [ $released -eq 0 ] || [ $elapsed -ge 300 ]; do curl -m 5 -f http://pod-rate-limiter.kube-system.svc.cluster.local/is_pod_released?pod=$POD_NAME\\&node=$NODE_NAME; released=$?; now=`date +%s`; elapsed=`expr $now - $start`; sleep 1; done".to_string()
-            ]),
-            command: Some(vec!["/bin/sh".to_string()]),
-            env: Some(vec![
-                EnvVar {
-                    name: "NODE_NAME".to_string(),
-                    value: None,
-                    value_from: Some(EnvVarSource {
-                        config_map_key_ref: None,
-                        field_ref: Some(ObjectFieldSelector {
-                            api_version: None,
-                            field_path: "spec.nodeName".to_string()
-                        }),
-                        resource_field_ref: None,
-                        secret_key_ref: None,
-                    })
-                },
-                EnvVar {
-                    name: "POD_NAME".to_string(),
-                    value: None,
-                    value_from: Some(EnvVarSource {
-                        config_map_key_ref: None,
-                        field_ref: Some(ObjectFieldSelector {
-                            api_version: None,
-                            field_path: "metadata.name".to_string()
-                        }),
-                        resource_field_ref: None,
-                        secret_key_ref: None,
-                    })
-                },
-            ]),
-            env_from: None,
-            image: Some("curlimages/curl".to_string()),
-            image_pull_policy: None,
-            lifecycle: None,
-            liveness_probe: None,
-            name: "pod-rate-limiter-init".to_string(),
-            ports: None,
-            readiness_probe: None,
-            resources: None,
-            security_context: None,
-            startup_probe: None,
-            stdin: None,
-            stdin_once: None,
-            termination_message_path: None,
-            termination_message_policy: None,
-            tty: None,
-            volume_devices: None,
-            volume_mounts: None,
-            working_dir: None,
-        })
+        Some(build_init_container())
     } else {
         None
     };
@@ -164,6 +107,36 @@ pub async fn mutate(
     //   and hope we get the event in time.
 
     HttpResponse::Ok().json(admission_response)
+}
+
+fn build_init_container() -> Container {
+    serde_json::from_value(json!({
+        "command":"/bin/sh",
+        "args":[
+            "-c",
+            "start=`date +%s`; elapsed=0; released=-1; until [ $released -eq 0 ] || [ $elapsed -ge 600 ]; do curl -m 5 -f http://pod-rate-limiter.kube-system.svc.cluster.local/is_pod_released?pod=$POD_NAME\\&node=$NODE_NAME; released=$?; now=`date +%s`; elapsed=`expr $now - $start`; sleep 1; done"
+        ],
+        "name":"pod-rate-limiter-init",
+        "image":"curlimages/curl",
+        "env":[
+            {
+                "name":"NODE_NAME",
+                "value_from":{
+                    "field_ref":{
+                        "field_path":"spec.nodeName"
+                    }
+                }
+            },
+            {
+                "name":"POD_NAME",
+                "value_from":{
+                    "field_ref":{
+                        "field_path":"metadata.name"
+                    }
+                }
+            }
+        ]
+    })).unwrap()
 }
 
 // Admission related structs not defined in k8s_openapi
