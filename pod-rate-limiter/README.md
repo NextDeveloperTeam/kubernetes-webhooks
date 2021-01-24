@@ -15,3 +15,4 @@ TODO
 [] Unit tests
 [] Logging
 [] Metrics + alerting
+[] Static link openssl?
