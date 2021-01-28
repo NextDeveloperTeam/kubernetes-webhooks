@@ -53,7 +53,6 @@ impl RateLimitingController {
 
         Self {
             data: Arc::new(Mutex::new(RateLimitingControllerData {
-                //pods_pending_assignment: HashSet::new(),
                 nodes_to_pods: HashMap::new(),
             })),
             pods_api: pods,
@@ -131,10 +130,6 @@ impl RateLimitingController {
                 {
                     let mut data = this.data.lock().unwrap();
 
-                    // clear any pods in `pods_pending_assignment` that no longer exist
-                    // data.pods_pending_assignment
-                    //     .retain(|p| pod_names.contains(p));
-
                     println!("Node names: {:#?}", node_names);
                     println!("nodes_to_pods:\n\t{:#?}", data.nodes_to_pods);
                     // clear any nodes in `nodes_to_pods` that no longer exist
@@ -195,8 +190,6 @@ impl RateLimitingController {
 
         let mut data = self.data.lock().unwrap();
 
-        //data.pods_pending_assignment.remove(pod_name.as_str());
-
         let pods = data
             .nodes_to_pods
             .entry(node.to_string())
@@ -219,8 +212,6 @@ impl RateLimitingController {
         println!("Releasing pod: {:?} on node: {:?}", Meta::name(pod), node);
 
         let mut data = self.data.lock().unwrap();
-
-        //data.pods_pending_assignment.remove(pod_name.as_str());
 
         if let Some(v) = data.nodes_to_pods.get_mut(node.as_str()) {
             v.retain(|x| *x != pod_name)
@@ -263,7 +254,7 @@ impl RateLimitingController {
         //   todo: check that this happens after the first crash and not after some N number of crashes
         //   add metrics for the DELETE and adjust crash looping alerts
         //   add naive crash looping backoff handling
-        // if 'terminating/dead' => remove from nodes_to_pods & pods_pending_assignment
+        // if 'terminating/dead' => remove from nodes_to_pods
 
         // TODO: review status, etc: https://github.com/kubernetes/kube-state-metrics/blob/master/docs/pod-metrics.md
 
