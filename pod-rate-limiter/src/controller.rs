@@ -4,8 +4,8 @@ use actix_web::{get, web, FromRequest, HttpRequest, HttpResponse, Responder};
 use futures::future::{ok, Ready};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::ListParams;
 use kube::api::{Api, Meta};
+use kube::api::{DeleteParams, ListParams};
 use kube_runtime::reflector::Store;
 use kube_runtime::utils::try_flatten_touched;
 use kube_runtime::{reflector, watcher};
@@ -43,28 +43,33 @@ struct RateLimitingControllerData {
     nodes_to_pods: HashMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RateLimitingController {
     data: Arc<Mutex<RateLimitingControllerData>>,
+    pods_api: Api<Pod>,
 }
 
 impl RateLimitingController {
-    pub fn new(registry: Registry) -> Self {
+    pub async fn new(registry: Registry) -> Self {
+        let client = kube::Client::try_default().await.expect("create client");
+        let pods = Api::<Pod>::all(client.clone());
+
         Self {
             data: Arc::new(Mutex::new(RateLimitingControllerData {
                 pods_pending_assignment: HashSet::new(),
                 nodes_to_pods: HashMap::new(),
             })),
+            pods_api: pods,
         }
     }
 
     pub async fn run(&self) {
-        let client = kube::Client::try_default().await.expect("create client");
-        let pods = Api::<Pod>::all(client.clone());
-
         let pod_store = reflector::store::Writer::<Pod>::default();
         let pod_store_reader = pod_store.as_reader();
-        let pod_reflector = reflector(pod_store, watcher(pods, ListParams::default()));
+        let pod_reflector = reflector(
+            pod_store,
+            watcher(self.pods_api.clone(), ListParams::default()),
+        );
 
         println!("Starting reconciler");
         self.spawn_reconciler(pod_store_reader);
@@ -82,7 +87,7 @@ impl RateLimitingController {
                 // some sort of Err() or Ok(None).  Log and sleep? Will the stream recover?
                 Err(e) => {
                     println!("Processing loop error. {:?}", e);
-                    tokio::time::delay_for(Duration::from_secs(10)).await;
+                    tokio::time::delay_for(Duration::from_secs(1)).await;
                 }
                 Ok(None) => {
                     // TODO: if the stream is restarted do we get a None or just the Restarted (which is filtered by 'try_flatted_touched`)
@@ -100,7 +105,7 @@ impl RateLimitingController {
 
         tokio::spawn(async move {
             // delay initial iteration since the store is empty upon start.
-            let delay = 10; // 120. 10 for debuging
+            let delay = 10; // 120. 10 for debugging
             tokio::time::delay_for(Duration::from_secs(delay)).await;
 
             loop {
@@ -147,10 +152,9 @@ impl RateLimitingController {
                             let pods_on_node: HashSet<String> = pod_store
                                 .state()
                                 .iter()
-                                .filter(|p|
-                                    match p.spec.as_ref().unwrap().node_name.as_ref() {
-                                        Some(n) => *n == node,
-                                        _ => false
+                                .filter(|p| match &p.spec.as_ref().unwrap().node_name {
+                                    Some(n) => *n == node,
+                                    _ => false,
                                 })
                                 .map(|p| Meta::name(p))
                                 .collect();
@@ -216,14 +220,6 @@ impl RateLimitingController {
         }
     }
 
-    fn requeue_pod(&self, pod: &Pod) {
-        // TODO: rework lock scoping. There's a race here if a
-        // `is_pod_released` call happens in between the
-        // release & enqueu
-        self.release_pod(pod);
-        self.enqueue_pod(pod);
-    }
-
     fn release_pod(&self, pod: &Pod) {
         // add metrics & logs
         println!("Releasing pod: {:?}", Meta::name(pod));
@@ -245,6 +241,22 @@ impl RateLimitingController {
             println!("Node not found: {:?}", node);
             // log?  should not happen?
         }
+    }
+
+    fn delete_pod(&self, pod: &Pod) {
+        let api = self.pods_api.clone();
+        let pod_name = Meta::name(pod);
+
+        // spawn the delete to avoid making this function async and it infecting upwards
+        tokio::spawn(async move {
+            let dp = DeleteParams {
+                grace_period_seconds: Some(0),
+                ..Default::default()
+            };
+
+            // TODO log/handle await Result
+            api.delete(pod_name.as_str(), &dp).await;
+        });
     }
 
     fn process_pod(&self, pod: &Pod) {
@@ -277,7 +289,7 @@ impl RateLimitingController {
             let mut deleting = false;
             let mut scheduled = false;
             let mut ready = false;
-            let mut crash_loop_back_off = false;
+            let mut restarted = false;
             let phase = pod.status.as_ref().unwrap().phase.as_ref().unwrap();
 
             let status = pod.status.as_ref().unwrap();
@@ -295,52 +307,36 @@ impl RateLimitingController {
                 deleting = container_status
                     .iter()
                     .all(|c| c.state.as_ref().unwrap().terminated.is_some());
-                crash_loop_back_off = container_status.iter().any(|c| {
-                    // TODO: yuck, add var
-                    c.state.as_ref().unwrap().waiting.is_some()
-                        && c.state
-                            .as_ref()
-                            .unwrap()
-                            .waiting
-                            .as_ref()
-                            .unwrap()
-                            .reason
-                            .is_some()
-                        && c.state
-                            .as_ref()
-                            .unwrap()
-                            .waiting
-                            .as_ref()
-                            .unwrap()
-                            .reason
-                            .as_ref()
-                            .unwrap()
-                            == "CrashLoopBackOff"
-                });
+                restarted = container_status.iter().any(|c| c.restart_count > 0);
             }
 
             println!(
-                "\tScheduled: {:?}, Ready: {:?}, Deleting: {:?}, Pod: {:?}",
+                "\tScheduled: {:?}, Ready: {:?}, Deleting: {:?}, Restarted: {:?}, Pod: {:?}",
                 scheduled,
                 ready,
                 deleting,
+                restarted,
                 Meta::name(pod)
             );
 
             // order important here. `deleting` and `scheduled` may both be true, so handle deleting first.
-            // similarly, 'ready' and 'scheduled' may both be true, so handle 'ready' first
-            if deleting || ready || phase == "Failed" {
+            // similarly, 'ready' and 'scheduled' may both be true, so handle 'ready' prior to `scheduled`
+            if restarted {
+                // If a pod is restarted, we need to delete it to force the pod-rate-limiter-init process
+                // to run again.  Otherwise the crashing container will start up again without checking
+                // for rate limiting and throw off our rate limiting assumptions.
+                // This will move it to the back the queue, which is probably OK since it crashed and
+                // may need a backoff anyway (which would occur anyway if the container fails a few times).
+                self.delete_pod(pod);
+            } else if deleting || ready || phase == "Failed" {
                 // || "time expired?"
                 self.release_pod(pod);
-            } else if crash_loop_back_off {
-                //TODO: self.delete_pod(pod);
-                //self.requeue_pod(pod);
             } else if scheduled {
                 // this feels a bit aggressive. what other conditions result in a 'scheduled'
                 // pod, but one that should not be enqueued?
                 self.enqueue_pod(pod);
             } else {
-                // should not happen? log?
+                // should not happen? log & metric?
             }
         }
     }
@@ -383,7 +379,6 @@ mod tests {
     use kube::api::{DeleteParams, ListParams, PostParams, WatchEvent};
     use kube::Api;
     use serde_json::json;
-    use tokio::time::{delay_for, Duration};
 
     #[tokio::test]
     async fn test() -> anyhow::Result<()> {
@@ -391,7 +386,7 @@ mod tests {
         reset_pods(&pod_names).await?;
 
         let registry = prometheus::Registry::default();
-        let controller = RateLimitingController::new(registry.clone());
+        let controller = RateLimitingController::new(registry.clone()).await;
 
         let client = kube::Client::try_default().await.expect("create client");
         let pods = Api::<Pod>::namespaced(client.clone(), "default");
@@ -413,6 +408,7 @@ mod tests {
             }
         }))?;
 
+        // Start the controller's logic
         let controller_spawn = controller.clone();
         tokio::spawn(async move { controller_spawn.run().await });
 
@@ -438,8 +434,6 @@ mod tests {
             };
         }
 
-        delay_for(Duration::from_millis(50)).await;
-
         for i in 0..3 {
             let pod_name = pod_names.get(i).unwrap();
             assert_released(pod_name, i + 1, &pod_names, &controller);
@@ -456,7 +450,7 @@ mod tests {
         Ok(())
     }
 
-    async fn wait_for_running(pod_name: &str, pods: Api::<Pod>) -> anyhow::Result<()> {
+    async fn wait_for_running(pod_name: &str, pods: Api<Pod>) -> anyhow::Result<()> {
         let lp = ListParams::default()
             .fields(&format!("metadata.name={}", pod_name))
             .timeout(20);
@@ -480,7 +474,7 @@ mod tests {
 
         match running {
             true => Ok(()),
-            false => Err(anyhow!("Pod not ready: {}", pod_name))
+            false => Err(anyhow!("Pod not ready: {}", pod_name)),
         }
     }
 

@@ -1,5 +1,5 @@
-use actix_web_prom::PrometheusMetrics;
 use actix_web::{get, middleware, post, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web_prom::PrometheusMetrics;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use std::path::Path;
 //use log::{debug, error, info, log_enabled, Level};
@@ -18,7 +18,7 @@ async fn main() -> Result<(), ()> {
 
     let prometheus = PrometheusMetrics::new("api", Some("/metrics"), None);
 
-    let controller = controller::RateLimitingController::new(prometheus.registry.clone());
+    let controller = controller::RateLimitingController::new(prometheus.registry.clone()).await;
     let controller_app_data = controller.clone();
 
     let mut server = HttpServer::new(move || {
