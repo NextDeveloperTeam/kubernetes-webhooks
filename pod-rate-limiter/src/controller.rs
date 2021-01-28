@@ -19,8 +19,7 @@ use tokio::time::Duration;
 
 // Flow:
 // - The MutatingAdmissionWebhook injects a rate limiting init container. The init container polls this service to query its "released" status.
-//   - At this point the pod is not yet assigned to a node, so we watch for assignment events and put it in the `pods_pending_assignment` set in the meantime.
-// - Once pod is assigned move it from the `pods_pending_assignments` set to the `nodes_to_pods` map.
+// - Once pod is assigned to a node add it to the `nodes_to_pods` map.
 // - Wait for pods to become "ready".
 //   - Upon becoming ready, remove from the `nodes_to_pods` map (as well as the `pods_pending_assignment` set just in case).
 //   - Removing the pod from the `nodes_to_pods` maps releases the next pod in the queue, if any.
@@ -29,8 +28,6 @@ use tokio::time::Duration;
 //
 // Exception cases:
 // - If a pod does not become ready after X minutes, remove from the `nodes_to_pods` map and release new pods.
-// - If a pod never moves from the `pods_pending_assignments` to `nodes_to_pods` map.  Some cases of this may
-//   be expected if other admission webhooks deny entry.
 // Exceptions should emit metrics and log sufficient details for debugging, whether an issue with this service or
 // the cluster.
 // - If pod errors what happens?
@@ -39,7 +36,7 @@ use tokio::time::Duration;
 
 #[derive(Debug, Clone)]
 struct RateLimitingControllerData {
-    pods_pending_assignment: HashSet<String>, // probably record podname+timestamp to purge pods that are never assigned and get deleted (e.g. denied by another admission controller, other failures)
+    //pods_pending_assignment: HashSet<String>, // probably record podname+timestamp to purge pods that are never assigned and get deleted (e.g. denied by another admission controller, other failures)
     nodes_to_pods: HashMap<String, Vec<String>>,
 }
 
@@ -56,7 +53,7 @@ impl RateLimitingController {
 
         Self {
             data: Arc::new(Mutex::new(RateLimitingControllerData {
-                pods_pending_assignment: HashSet::new(),
+                //pods_pending_assignment: HashSet::new(),
                 nodes_to_pods: HashMap::new(),
             })),
             pods_api: pods,
@@ -135,8 +132,8 @@ impl RateLimitingController {
                     let mut data = this.data.lock().unwrap();
 
                     // clear any pods in `pods_pending_assignment` that no longer exist
-                    data.pods_pending_assignment
-                        .retain(|p| pod_names.contains(p));
+                    // data.pods_pending_assignment
+                    //     .retain(|p| pod_names.contains(p));
 
                     println!("Node names: {:#?}", node_names);
                     println!("nodes_to_pods:\n\t{:#?}", data.nodes_to_pods);
@@ -170,16 +167,6 @@ impl RateLimitingController {
         });
     }
 
-    pub fn add_pod_pending_assignment(&self, pod_name: String) {
-        // add metrics & logs
-
-        self.data
-            .lock()
-            .unwrap()
-            .pods_pending_assignment
-            .insert(pod_name);
-    }
-
     pub fn is_pod_released(&self, node_name: &str, pod_name: &str) -> bool {
         // add metrics & logs
         if pod_name.contains("backend-service") {
@@ -208,7 +195,7 @@ impl RateLimitingController {
 
         let mut data = self.data.lock().unwrap();
 
-        data.pods_pending_assignment.remove(pod_name.as_str());
+        //data.pods_pending_assignment.remove(pod_name.as_str());
 
         let pods = data
             .nodes_to_pods
@@ -233,7 +220,7 @@ impl RateLimitingController {
 
         let mut data = self.data.lock().unwrap();
 
-        data.pods_pending_assignment.remove(pod_name.as_str());
+        //data.pods_pending_assignment.remove(pod_name.as_str());
 
         if let Some(v) = data.nodes_to_pods.get_mut(node.as_str()) {
             v.retain(|x| *x != pod_name)
@@ -269,7 +256,7 @@ impl RateLimitingController {
 
         //println!("{:#?}\n\n", pod.status.as_ref().unwrap());
 
-        // if 'starting', no node assigned => pods_pending_assignment
+        // if 'starting', no node assigned, do nothing
         // if 'not ready' => move to nodes_to_pods
         // if 'ready' => remove from nodes_to_pods
         // if 'waiting' => kill pod : |  This will force the init container to re-run
@@ -283,61 +270,61 @@ impl RateLimitingController {
         // TODO: verify logic here for `evicted`, other cases? => `phase=Failed`?
         // TODO: handle pods w/ startup probes (prefer over 'ready')
         if pod.spec.as_ref().unwrap().node_name.is_none() {
-            println!("No node name");
-            self.add_pod_pending_assignment(Meta::name(pod));
+            // no node assigned, do nothing until the pod is scheduled on a node
+            return;
+        }
+
+        let mut deleting = false;
+        let mut scheduled = false;
+        let mut ready = false;
+        let mut restarted = false;
+        let phase = pod.status.as_ref().unwrap().phase.as_ref().unwrap();
+
+        let status = pod.status.as_ref().unwrap();
+
+        if let Some(conds) = &status.conditions {
+            scheduled = conds
+                .iter()
+                .any(|c| c.type_ == "PodScheduled" && c.status == "True");
+            ready = conds
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True");
+        }
+
+        if let Some(container_status) = &status.container_statuses {
+            deleting = container_status
+                .iter()
+                .all(|c| c.state.as_ref().unwrap().terminated.is_some());
+            restarted = container_status.iter().any(|c| c.restart_count > 0);
+        }
+
+        println!(
+            "\tScheduled: {:?}, Ready: {:?}, Deleting: {:?}, Restarted: {:?}, Pod: {:?}",
+            scheduled,
+            ready,
+            deleting,
+            restarted,
+            Meta::name(pod)
+        );
+
+        // order important here. `deleting` and `scheduled` may both be true, so handle deleting first.
+        // similarly, 'ready' and 'scheduled' may both be true, so handle 'ready' prior to `scheduled`
+        if restarted {
+            // If a pod is restarted, we need to delete it to force the pod-rate-limiter-init process
+            // to run again.  Otherwise the crashing container will start up again without checking
+            // for rate limiting and throw off our rate limiting assumptions.
+            // This will move it to the back the queue, which is probably OK since it crashed and
+            // may need a backoff anyway (which would occur anyway if the container fails a few times).
+            self.delete_pod(pod);
+        } else if deleting || ready || phase == "Failed" {
+            // || "time expired?"
+            self.release_pod(pod);
+        } else if scheduled {
+            // this feels a bit aggressive. what other conditions result in a 'scheduled'
+            // pod, but one that should not be enqueued?
+            self.enqueue_pod(pod);
         } else {
-            let mut deleting = false;
-            let mut scheduled = false;
-            let mut ready = false;
-            let mut restarted = false;
-            let phase = pod.status.as_ref().unwrap().phase.as_ref().unwrap();
-
-            let status = pod.status.as_ref().unwrap();
-
-            if let Some(conds) = &status.conditions {
-                scheduled = conds
-                    .iter()
-                    .any(|c| c.type_ == "PodScheduled" && c.status == "True");
-                ready = conds
-                    .iter()
-                    .any(|c| c.type_ == "Ready" && c.status == "True");
-            }
-
-            if let Some(container_status) = &status.container_statuses {
-                deleting = container_status
-                    .iter()
-                    .all(|c| c.state.as_ref().unwrap().terminated.is_some());
-                restarted = container_status.iter().any(|c| c.restart_count > 0);
-            }
-
-            println!(
-                "\tScheduled: {:?}, Ready: {:?}, Deleting: {:?}, Restarted: {:?}, Pod: {:?}",
-                scheduled,
-                ready,
-                deleting,
-                restarted,
-                Meta::name(pod)
-            );
-
-            // order important here. `deleting` and `scheduled` may both be true, so handle deleting first.
-            // similarly, 'ready' and 'scheduled' may both be true, so handle 'ready' prior to `scheduled`
-            if restarted {
-                // If a pod is restarted, we need to delete it to force the pod-rate-limiter-init process
-                // to run again.  Otherwise the crashing container will start up again without checking
-                // for rate limiting and throw off our rate limiting assumptions.
-                // This will move it to the back the queue, which is probably OK since it crashed and
-                // may need a backoff anyway (which would occur anyway if the container fails a few times).
-                self.delete_pod(pod);
-            } else if deleting || ready || phase == "Failed" {
-                // || "time expired?"
-                self.release_pod(pod);
-            } else if scheduled {
-                // this feels a bit aggressive. what other conditions result in a 'scheduled'
-                // pod, but one that should not be enqueued?
-                self.enqueue_pod(pod);
-            } else {
-                // should not happen? log & metric?
-            }
+            // should not happen? log & metric?
         }
     }
 }
@@ -442,7 +429,6 @@ mod tests {
             println!("Pod is ready");
         }
 
-        // hard to check `controller.add_pod_pending_assignment()`. Add metrics to verify 3 items hit this list?
         // check any other internal state?
 
         reset_pods(&pod_names).await?;
