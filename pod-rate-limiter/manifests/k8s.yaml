@@ -32,6 +32,40 @@ spec:
     kind: ClusterIssuer
     group: cert-manager.io
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-rate-limiter
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-rate-limiter
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+      - delete
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: pod-rate-limiter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-rate-limiter
+subjects:
+  - kind: ServiceAccount
+    name: pod-rate-limiter
+    namespace: kube-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,29 +83,24 @@ spec:
       labels:
         app: pod-rate-limiter
     spec:
-      # affinity:
-      #   podAntiAffinity:
-      #     # do not schedule on the same node to avoid `hostNetwork` port conflicts
-      #     requiredDuringSchedulingIgnoredDuringExecution:
-      #     - topologyKey: "kubernetes.io/hostname"
-      #       labelSelector:
-      #         matchExpressions:
-      #         - key: app
-      #           operator: In
-      #           values:
-      #             - pod-rate-limiter
+      affinity:
+        podAntiAffinity:
+          # do not schedule on the same node to avoid `hostNetwork` port conflicts
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: "kubernetes.io/hostname"
+            labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - pod-rate-limiter
       containers:
         - name: pod-rate-limiter
-          #command: ["bash", "-c", "cat /tmp/k8s-webhook-server/serving-certs/tls.key"]
-          # args:
-          #   - -metrics-addr=:18080
-          #   - -health-addr=:18081
-          #   - -listen-port=19443
           env:
             - name: RUST_BACKTRACE
               value: "FULL"
-          image: pod-rate-limiter:12 #123456789012.dkr.ecr.us-east-1.amazonaws.com/registry/docker-proxy
-          imagePullPolicy: Never # ALways
+          image: 595477448247.dkr.ecr.us-west-2.amazonaws.com/nexttrucking/temp:pod-rate-limiter-28 #123456789012.dkr.ecr.us-east-1.amazonaws.com/registry/docker-proxy
+          # imagePullPolicy: Never # ALways
           # Graceful shutdown hack - sleep 15 seconds to give the k8s network
           # config time to update and stop routing new requests to this pod.
           # lifecycle:
@@ -88,13 +117,6 @@ spec:
             - containerPort: 8443
               protocol: TCP
               name: https
-          #     name: https
-          #   - containerPort: 18080
-          #     protocol: TCP
-          #     name: metrics
-          #   - containerPort: 18081
-          #     protocol: TCP
-          #     name: monitoring
 #          resources:
 #            requests:
 #              memory: $REQUESTS_MEMORY
@@ -102,28 +124,26 @@ spec:
 #            limits:
 #              memory: $LIMITS_MEMORY
 #              cpu: $LIMITS_CPU
-          # livenessProbe:
-          #   httpGet:
-          #     path: /healthz
-          #     port: monitoring
-          #   initialDelaySeconds: 10
-          #   timeoutSeconds: 5
-          # readinessProbe:
-          #   httpGet:
-          #     path: /readyz
-          #     port: monitoring
-          #   successThreshold: 1
-          #   failureThreshold: 2
-          #   periodSeconds: 5
-          #   timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            successThreshold: 1
+            failureThreshold: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
               name: cert
               readOnly: true
-          #   - mountPath: /tmp/config
-          #     name: docker-proxy-config
-          #     readOnly: true
-      #hostNetwork: true
+      hostNetwork: true
+      serviceAccountName: pod-rate-limiter
       volumes:
         - name: cert
           secret:
@@ -147,14 +167,10 @@ spec:
       port: 80
       protocol: TCP
       targetPort: http
-    # - name: metrics
-    #   port: 8080
-    #   protocol: TCP
-    #   targetPort: metrics
-    # - name: monitoring
-    #   port: 8081
-    #   protocol: TCP
-    #   targetPort: monitoring
+    - name: metrics
+      port: 8080
+      protocol: TCP
+      targetPort: http
   selector:
     app: pod-rate-limiter
   type: ClusterIP
@@ -190,20 +206,20 @@ webhooks:
     sideEffects: None
     matchPolicy: Equivalent
     reinvocationPolicy: IfNeeded
-# ---
-# apiVersion: monitoring.coreos.com/v1
-# kind: ServiceMonitor
-# metadata:
-#   labels:
-#     app: pod-rate-limiter
-#   name: pod-rate-limiter
-#   namespace: kube-system
-# spec:
-#   endpoints:
-#   - port: metrics
-#   selector:
-#     matchLabels:
-#       app: pod-rate-limiter
-#   namespaceSelector:
-#     matchNames:
-#     - kube-system
+---
+ apiVersion: monitoring.coreos.com/v1
+ kind: ServiceMonitor
+ metadata:
+   labels:
+     app: pod-rate-limiter
+   name: pod-rate-limiter
+   namespace: kube-system
+ spec:
+   endpoints:
+   - port: metrics
+   selector:
+     matchLabels:
+       app: pod-rate-limiter
+   namespaceSelector:
+     matchNames:
+     - kube-system

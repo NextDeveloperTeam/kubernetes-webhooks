@@ -21,13 +21,14 @@ use tokio::time::Duration;
 // - The MutatingAdmissionWebhook injects a rate limiting init container. The init container polls this service to query its "released" status.
 // - Once pod is assigned to a node add it to the `nodes_to_pods` map.
 // - Wait for pods to become "ready".
-//   - Upon becoming ready, remove from the `nodes_to_pods` map (as well as the `pods_pending_assignment` set just in case).
+//   - Upon becoming ready, remove from the `nodes_to_pods` map
 //   - Removing the pod from the `nodes_to_pods` maps releases the next pod in the queue, if any.
 //     - Todo: nice to have in the future is ability to check the liveness and startup probes, if any.
 //       - Use case: some pods are alive, but never ready, such as a hot standby pod.
 //
 // Exception cases:
 // - If a pod does not become ready after X minutes, remove from the `nodes_to_pods` map and release new pods.
+//    - This is kind of a pain since the reconciler will try to readd it. Instead just ignore if it's "old".
 // Exceptions should emit metrics and log sufficient details for debugging, whether an issue with this service or
 // the cluster.
 // - If pod errors what happens?
@@ -63,7 +64,10 @@ impl RateLimitingController {
         let pod_store_reader = pod_store.as_reader();
         let pod_reflector = reflector(
             pod_store,
-            watcher(self.pods_api.clone(), ListParams::default()),
+            watcher(
+                self.pods_api.clone(),
+                ListParams::default().labels("pod-rate-limiter=enabled"),
+            ),
         );
 
         println!("Starting reconciler");
@@ -79,10 +83,10 @@ impl RateLimitingController {
                     // println!("Event: {:?}", pod);
                     self.process_pod(pod);
                 }
-                // some sort of Err() or Ok(None).  Log and sleep? Will the stream recover?
+                // some sort of Err() or Ok(None).  Log and sleep? Will the stream recover? -> yes
                 Err(e) => {
                     println!("Processing loop error. {:?}", e);
-                    tokio::time::delay_for(Duration::from_secs(1)).await;
+                    tokio::time::delay_for(Duration::from_secs(15)).await;
                 }
                 Ok(None) => {
                     // TODO: if the stream is restarted do we get a None or just the Restarted (which is filtered by 'try_flatted_touched`)
@@ -100,16 +104,12 @@ impl RateLimitingController {
 
         tokio::spawn(async move {
             // delay initial iteration since the store is empty upon start.
-            let delay = 10; // 120. 10 for debugging
+            let delay = 120;
             tokio::time::delay_for(Duration::from_secs(delay)).await;
 
             loop {
                 println!("Reconciling");
                 let pod_state = pod_store.state();
-
-                // clear lost objects
-                // let pod_names: HashSet<String> =
-                //     pod_state.iter().map(|p| Meta::name(p)).cloned().collect();
 
                 let node_names: HashSet<String> = pod_state
                     .iter()
@@ -117,7 +117,7 @@ impl RateLimitingController {
                     .cloned()
                     .collect();
 
-                // ensure current state matches the store
+                // ensure current state includes all items from the pod store
                 for pod in pod_state {
                     this.process_pod(pod);
                 }
@@ -165,53 +165,57 @@ impl RateLimitingController {
 
         //println!("is_pod_released data: {:#?}", data);
 
-        match data.nodes_to_pods.get(node_name) {
-            None => {
-                // should not happen unless we're really out of sync - log
-                false
-            }
-            Some(pods) => {
-                let first_rate_limited_pod = pods.iter().find(|p| {
-                    // find the first pod that is NOT ready and has an pod-rate-limiter-init container
-                    let conditions = p.status.as_ref().unwrap().conditions.as_ref().unwrap();
+        let released = if let Some(pods) = data.nodes_to_pods.get(node_name) {
+            let first_rate_limited_pod = pods.iter().find(|p| {
+                // find the first pod that is NOT ready and has an pod-rate-limiter-init container
+                let conditions = p.status.as_ref().unwrap().conditions.as_ref().unwrap();
 
-                    let ready = conditions
-                        .iter()
-                        .any(|c| c.type_ == "Ready" && c.status == "True");
+                let ready = conditions
+                    .iter()
+                    .any(|c| c.type_ == "Ready" && c.status == "True");
 
-                    let has_init_container = p
-                        .spec
-                        .as_ref()
-                        .unwrap()
-                        .init_containers
-                        .as_ref()
-                        .unwrap()
-                        .iter()
-                        .any(|c| c.name == "pod-rate-limiter-init");
+                let has_init_container = p
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .init_containers
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.name == "pod-rate-limiter-init");
 
-                    // println!(
-                    //     "Pod: {}, ready: {}, has_init_container: {}",
-                    //     Meta::name(*p),
-                    //     ready,
-                    //     has_init_container
-                    // );
-                    !ready && has_init_container
-                });
+                // TODO: check that no init pod is stuck in `state.waiting` (e.g. ErrImageNeverPull)
+                //       or alternatively that all pods are state.running or completed?
 
-                // If the first non-ready pod matches the name, then consider that pod released
-                match first_rate_limited_pod {
-                    None => {
-                        println!("Did not find a non-ready pod with the init container");
-                        false
-                    }
-                    Some(pod) => {
-                        let is_ready = Meta::name(pod) == pod_name;
-                        println!("Pod: {}, is_ready: {}", Meta::name(pod), is_ready);
-                        is_ready
-                    }
+                println!(
+                    "Pod: {}, ready: {}, has_init_container: {}",
+                    Meta::name(*p),
+                    ready,
+                    has_init_container
+                );
+                !ready && has_init_container
+            });
+
+            // If the first non-ready pod matches the name, then consider that pod released
+            match first_rate_limited_pod {
+                None => {
+                    println!("Did not find a non-ready pod with the init container");
+                    false
+                }
+                Some(pod) => {
+                    let is_ready = Meta::name(pod) == pod_name;
+                    println!("Pod: {}, is_ready: {}", Meta::name(pod), is_ready);
+                    is_ready
                 }
             }
-        }
+        } else {
+            // should not happen unless we're really out of sync - log
+            false
+        };
+
+        println!("is pod released. pod: {}, released: {}", pod_name, released);
+
+        released
     }
 
     fn enqueue_pod(&self, pod: Pod) {
@@ -243,18 +247,17 @@ impl RateLimitingController {
 
         let pod_name = Meta::name(pod);
 
-        // TODO: handle cases where no node is not yet assigned (return/no-op)
-        let node = pod.spec.as_ref().unwrap().node_name.as_ref().unwrap();
+        if let Some(node) = pod.spec.as_ref().unwrap().node_name.as_ref() {
+            println!("Dropping pod: {:?} on node: {:?}", Meta::name(pod), node);
 
-        println!("Dropping pod: {:?} on node: {:?}", Meta::name(pod), node);
+            let mut data = self.data.lock().unwrap();
 
-        let mut data = self.data.lock().unwrap();
-
-        match data.nodes_to_pods.get_mut(node.as_str()) {
-            Some(v) => v.retain(|p| Meta::name(p) != pod_name),
-            None => {
-                println!("Node not found: {:?}", node)
-                // log?  should not happen?
+            match data.nodes_to_pods.get_mut(node.as_str()) {
+                Some(v) => v.retain(|p| Meta::name(p) != pod_name),
+                None => {
+                    println!("Node not found: {:?}", node)
+                    // log?  should not happen?
+                }
             }
         }
     }
@@ -283,28 +286,20 @@ impl RateLimitingController {
             pod.spec.as_ref().unwrap().node_name
         );
 
-        //println!("{:#?}\n\n", pod.status.as_ref().unwrap());
-
-        // if 'starting', no node assigned, do nothing
-        // if 'not ready' => move to nodes_to_pods
-        // if 'ready' => remove from nodes_to_pods
-        // if 'waiting' => kill pod : |  This will force the init container to re-run
-        //   todo: check that this happens after the first crash and not after some N number of crashes
-        //   add metrics for the DELETE and adjust crash looping alerts
-        //   add naive crash looping backoff handling
-        // if 'terminating/dead' => remove from nodes_to_pods
-
-        // TODO: review status, etc: https://github.com/kubernetes/kube-state-metrics/blob/master/docs/pod-metrics.md
-
-        // TODO: verify logic here for `evicted`, other cases? => `phase=Failed`?
-        // TODO: handle pods w/ startup probes (prefer over 'ready')
         if pod.spec.as_ref().unwrap().node_name.is_none() {
             // no node assigned, do nothing until the pod is assigned to a node
             return;
         }
 
+        //println!("{:#?}\n\n", pod.status.as_ref().unwrap());
+
+        // TODO: review status, etc: https://github.com/kubernetes/kube-state-metrics/blob/master/docs/pod-metrics.md
+
+        // TODO: verify logic here for `evicted`, other cases? => `phase=Failed`?
+        // TODO: handle pods w/ startup probes (prefer over 'ready')
+
         let mut init_container_running = false;
-        let mut deleting = false;
+        //let mut deleting = false;
         let mut scheduled = false;
         let mut ready = false;
         let mut restarted = false;
@@ -320,7 +315,7 @@ impl RateLimitingController {
             "Failed" | "Succeeded" | "Unknown" => true,
             _ => false,
         };
-        let pending = pod.status.as_ref().unwrap().phase.as_ref().unwrap() == "Pending";
+        //let pending = pod.status.as_ref().unwrap().phase.as_ref().unwrap() == "Pending";
 
         let status = pod.status.as_ref().unwrap();
 
@@ -334,9 +329,9 @@ impl RateLimitingController {
         }
 
         if let Some(container_status) = &status.container_statuses {
-            deleting = container_status
-                .iter()
-                .all(|c| c.state.as_ref().unwrap().terminated.is_some());
+            // deleting = container_status
+            //     .iter()
+            //     .all(|c| c.state.as_ref().unwrap().terminated.is_some());
 
             restarted = container_status.iter().any(|c| c.restart_count > 0);
         }
@@ -344,11 +339,8 @@ impl RateLimitingController {
         if let Some(init_container_statuses) = &status.init_container_statuses {
             // do we care?
             // TODO: bail early if this pod is not rate limited (i.e. lacks the rate limiting container
-            // This is another safety net to avoid deleting pods we don't manage (perhaps easier to add a label
-            // or annotation to the pod in the webhook?... using a label we could filter these objects out in the ListParams.
             init_container_running = init_container_statuses
                 .iter()
-                .filter(|c| c.name == "pod-rate-limiter-init" && c.state.is_some())
                 .map(|c| c.state.as_ref())
                 .any(|s| s.unwrap().running.is_some());
 
@@ -356,12 +348,12 @@ impl RateLimitingController {
         }
 
         println!(
-            "\tScheduled: {:?}, Ready: {:?}, Deleting: {:?}, Restarted: {:?}, Pending: {:?}, Pod: {:?}",
+            "\tScheduled: {:?}, Ready: {:?}, Restarted: {:?}, Completed: {:?}, Pod: {:?}",
             scheduled,
             ready,
-            deleting,
+            // deleting,
             restarted,
-            pending,
+            completed,
             Meta::name(&pod)
         );
 
@@ -384,14 +376,12 @@ impl RateLimitingController {
             // Additionally, the pod's config may be corrupt or otherwise unable to start.  Leaving it
             // as a "released" pod may indefinitely block all other queued pods.
             self.delete_pod(&pod);
-        } else if ready || deleting || completed {
-            // || "time expired?"
+        } else if ready || completed {
+            // `deleting` do we care? just wait for completed
+            // || "time expired?" -> handle in reconciler?
             // typically we'll get the `ready` event unless the pod fails or completes quickly
             self.drop_pod(&pod);
         } else if scheduled {
-            // || starting?
-            // this feels a bit aggressive. what other conditions result in a 'scheduled'
-            // pod, but one that should not be enqueued?
             self.enqueue_pod(pod);
         } else {
             // should not happen? log & metric?
@@ -452,7 +442,12 @@ mod tests {
         let mut pod: Pod = serde_json::from_value(json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": { "name": "pod-rate-limiter-test" },
+            "metadata": {
+                "name": "pod-rate-limiter-test",
+                "labels": {
+                    "pod-rate-limiter": "enabled"
+                }
+            },
             "spec": {
                 "initContainers": [{
                     "name": "pod-rate-limiter-init",
@@ -569,7 +564,7 @@ mod tests {
             grace_period_seconds: Some(0),
             ..Default::default()
         };
-        let lp = ListParams::default();
+        let lp = ListParams::default().labels("pod-rate-limiter=enabled");
 
         for pod in pods.list(&lp).await? {
             let name = pod.metadata.name.unwrap();

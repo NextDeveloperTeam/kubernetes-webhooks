@@ -16,7 +16,8 @@ async fn main() -> Result<(), ()> {
     std::env::set_var("RUST_LOG", "actix_web=debug");
     env_logger::init();
 
-    let prometheus = PrometheusMetrics::new("api", Some("/metrics"), None);
+    // TODO: set namespace
+    let prometheus = PrometheusMetrics::new("", Some("/metrics"), None);
 
     let controller = controller::RateLimitingController::new(prometheus.registry.clone()).await;
     let controller_app_data = controller.clone();
@@ -24,12 +25,12 @@ async fn main() -> Result<(), ()> {
     let mut server = HttpServer::new(move || {
         App::new()
             .app_data(controller_app_data.clone())
+            .wrap(prometheus.clone()) // for now, this must be first or we'll log /metrics as a 404. Ref: https://github.com/nlopes/actix-web-prom/issues/39
             .wrap(
                 middleware::Logger::default()
                     .exclude("/healthz")
                     .exclude("/readyz"),
             )
-            .wrap(prometheus.clone())
             .service(health)
             .service(ready)
             .service(echo)
