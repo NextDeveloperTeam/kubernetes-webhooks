@@ -31,7 +31,7 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
     // Filter out backend-service since it runs on dedicated hosts
     if let Some(labels) = &pod.metadata.labels {
         if let Some(app) = labels.get("app") {
-            if app == "backend-service-job" {
+            if app.starts_with("backend-service") {
                 return HttpResponse::Ok().json(Response::new(AdmissionResponse {
                     allowed: true,
                     uid: admission_request.request.uid.to_string(),
