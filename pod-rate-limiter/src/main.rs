@@ -1,22 +1,20 @@
 use actix_web::{get, middleware, post, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_prom::PrometheusMetrics;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use std::ffi::OsString;
 use std::path::Path;
-//use log::{debug, error, info, log_enabled, Level};
+use tracing::Level;
+#[allow(unused_imports)]
+use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::EnvFilter;
 
 mod controller;
 mod mutating_webhook;
 
 #[actix_rt::main]
 async fn main() -> Result<(), ()> {
-    // tracing_subscriber::fmt()
-    //     .with_max_level(tracing::Level::INFO)
-    //     .init();
+    init_logging();
 
-    std::env::set_var("RUST_LOG", "actix_web=debug");
-    env_logger::init();
-
-    // TODO: set namespace
     let prometheus = PrometheusMetrics::new("", Some("/metrics"), None);
 
     let controller = controller::RateLimitingController::new(prometheus.registry.clone()).await;
@@ -25,11 +23,12 @@ async fn main() -> Result<(), ()> {
     let mut server = HttpServer::new(move || {
         App::new()
             .app_data(controller_app_data.clone())
-            .wrap(prometheus.clone()) // for now, this must be first or we'll log /metrics as a 404. Ref: https://github.com/nlopes/actix-web-prom/issues/39
+            .wrap(prometheus.clone()) // for now this must be first or we'll log calls to `/metrics` as a 404. Ref: https://github.com/nlopes/actix-web-prom/issues/39
             .wrap(
                 middleware::Logger::default()
                     .exclude("/healthz")
-                    .exclude("/readyz"),
+                    .exclude("/readyz")
+                    .exclude("/metrics"),
             )
             .service(health)
             .service(ready)
@@ -60,11 +59,33 @@ async fn main() -> Result<(), ()> {
     }
 
     tokio::select! {
-        _ = controller.run() => unreachable!("controller.run() ended. This should NOT happen - the `server` should exit first."), // TODO: log error as this shouldn't ever return first
+        _ = controller.run() => {
+                error!("controller.run() ended unexpectedly");
+                unreachable!("controller.run() ended. This should NOT happen - the `server` should exit first.")
+            },
         _ = server.run() => println!("server.run() ended"),
     }
 
     Ok(())
+}
+
+fn init_logging() {
+    let env_filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => EnvFilter::default()
+            .add_directive(Level::DEBUG.into())
+            .add_directive("hyper::proto=info".parse().unwrap())
+            .add_directive("hyper::client=info".parse().unwrap()),
+    };
+
+    let one = OsString::from("1");
+    match std::env::var_os("JSON_LOGGING") {
+        Some(var) if var == one => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init(),
+        _ => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+    }
 }
 
 #[get("/healthz")]
