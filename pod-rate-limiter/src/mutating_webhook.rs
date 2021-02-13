@@ -3,15 +3,24 @@ use k8s_openapi::api::authentication::v1::UserInfo;
 use k8s_openapi::api::core::v1::{Container, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use k8s_openapi::apimachinery::pkg::runtime::RawExtension;
+use once_cell::sync::Lazy;
+use prometheus::{opts, IntCounterVec, Registry};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace, warn};
 
+static MUTATE_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!("pod_rate_limiter_mutate_total", "Total calls to 'mutate'"),
+        &["result"],
+    )
+    .unwrap()
+});
+
 #[post("/mutate")]
 pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
-    // TODO: add metrics
     trace!(
         request = ?admission_request.0,
         "admission request"
@@ -26,6 +35,7 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
             .resource
             .is_some()
     {
+        MUTATE_COUNTER.with_label_values(&["invalid_input"]).inc();
         warn!("Malformed admission request");
         return HttpResponse::UnprocessableEntity().finish();
     }
@@ -42,6 +52,9 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
         .unwrap();
 
     if resource_type != "pods" {
+        MUTATE_COUNTER
+            .with_label_values(&["invalid_resource"])
+            .inc();
         warn!(id, ?resource_type, "Invalid resource type");
         return HttpResponse::UnprocessableEntity().finish();
     }
@@ -58,6 +71,7 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
     if let Some(labels) = &pod.metadata.labels {
         if let Some(app) = labels.get("app") {
             if app.starts_with("backend-service") {
+                MUTATE_COUNTER.with_label_values(&["skipped"]).inc();
                 debug!(id, ?app, "skipping app matching opt-out label");
                 return allow_without_mutation_response(admission_request);
             }
@@ -84,6 +98,9 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
             pod = pod_name.as_str(),
             "Pod already has the init container. Skipping"
         );
+        MUTATE_COUNTER
+            .with_label_values(&["already_processed"])
+            .inc();
         return allow_without_mutation_response(admission_request);
     }
 
@@ -133,6 +150,7 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
         "Admission Response."
     );
 
+    MUTATE_COUNTER.with_label_values(&["mutated"]).inc();
     HttpResponse::Ok().json(admission_response)
 }
 
@@ -172,6 +190,10 @@ fn build_init_container() -> Container {
             }
         ]
     })).unwrap()
+}
+
+pub fn register_metrics(registry: &Registry) {
+    registry.register(Box::new(MUTATE_COUNTER.clone())).unwrap();
 }
 
 // Admission related structs not defined in k8s_openapi

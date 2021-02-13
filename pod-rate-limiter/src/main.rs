@@ -16,8 +16,9 @@ async fn main() -> Result<(), ()> {
     init_logging();
 
     let prometheus = PrometheusMetrics::new("", Some("/metrics"), None);
+    mutating_webhook::register_metrics(&prometheus.registry);
 
-    let controller = controller::RateLimitingController::new(prometheus.registry.clone()).await;
+    let controller = controller::RateLimitingController::new(&prometheus.registry).await;
     let controller_app_data = controller.clone();
 
     let mut server = HttpServer::new(move || {

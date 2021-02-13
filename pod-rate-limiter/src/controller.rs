@@ -4,17 +4,15 @@ use actix_web::{get, web, FromRequest, HttpRequest, HttpResponse, Responder};
 use futures::future::{ok, Ready};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, Meta};
-use kube::api::{DeleteParams, ListParams};
+use kube::api::{Api, DeleteParams, ListParams, Meta};
 use kube_runtime::reflector::Store;
 use kube_runtime::utils::try_flatten_touched;
 use kube_runtime::{reflector, watcher};
-use prometheus::Registry;
+use once_cell::sync::Lazy;
+use prometheus::{opts, IntCounterVec, IntGaugeVec, Registry};
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace, warn};
@@ -37,6 +35,24 @@ use tracing::{debug, error, info, trace, warn};
 
 // TODO: Check all `unwraps` are handled correctly
 
+#[derive(Deserialize)]
+pub struct PodReleasedQuery {
+    node: String,
+    pod: String,
+}
+
+#[get("/is_pod_released")]
+pub async fn is_pod_released(
+    controller: RateLimitingController,
+    query: web::Query<PodReleasedQuery>,
+) -> impl Responder {
+    if controller.is_pod_released(query.node.as_str(), query.pod.as_str()) {
+        HttpResponse::new(StatusCode::OK)
+    } else {
+        HttpResponse::new(StatusCode::LOCKED)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RateLimitingControllerData {
     nodes_to_pods: HashMap<String, Vec<Pod>>,
@@ -48,8 +64,37 @@ pub struct RateLimitingController {
     pods_api: Api<Pod>,
 }
 
+static PENDING_PODS_GAUGE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        opts!(
+            "pod_rate_limiter_pending_pods",
+            "Count of pending pods by node"
+        ),
+        &["node"],
+    )
+    .unwrap()
+});
+
+static PROCESSED_PODS_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "pod_rate_limiter_processed_pods_total",
+            "Total processed pods"
+        ),
+        &["result"],
+    )
+    .unwrap()
+});
+
 impl RateLimitingController {
-    pub async fn new(registry: Registry) -> Self {
+    pub async fn new(registry: &Registry) -> Self {
+        registry
+            .register(Box::new(PENDING_PODS_GAUGE.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(PROCESSED_PODS_COUNTER.clone()))
+            .unwrap();
+
         let client = kube::Client::try_default().await.expect("create client");
         let pods = Api::<Pod>::all(client.clone());
 
@@ -81,18 +126,15 @@ impl RateLimitingController {
 
         loop {
             match pod_stream.try_next().await {
-                Ok(Some(pod)) => {
-                    // println!("Event: {:?}", pod);
-                    self.process_pod(pod);
-                }
+                Ok(Some(pod)) => self.process_pod(pod),
                 // some sort of Err() or Ok(None).  Log and sleep? Will the stream recover? -> yes
                 Err(e) => {
-                    println!("Processing loop error. {:?}", e);
+                    error!("Processing loop error. {:?}", e);
                     tokio::time::delay_for(Duration::from_secs(15)).await;
                 }
                 Ok(None) => {
                     // TODO: if the stream is restarted do we get a None or just the Restarted (which is filtered by 'try_flatted_touched`)
-                    println!("Event stream ended or graceful shutdown.");
+                    warn!("Event stream ended or graceful shutdown.");
                     break;
                 }
             }
@@ -128,6 +170,11 @@ impl RateLimitingController {
                     trace!(?node_names, nodes_to_pods = ?data.nodes_to_pods, "Reconciling pods across nodes");
 
                     // clear any nodes in `nodes_to_pods` that no longer exist
+                    for node_name in data.nodes_to_pods.keys() {
+                        if !node_names.contains(node_name) {
+                            PENDING_PODS_GAUGE.remove_label_values(&[node_name]);
+                        }
+                    }
                     data.nodes_to_pods.retain(|k, _| node_names.contains(k));
 
                     // clear any pods in `nodes_to_pods` that no longer exist
@@ -297,9 +344,12 @@ impl RateLimitingController {
         let pod_name = Meta::name(&pod);
 
         if pod.spec.as_ref().unwrap().node_name.is_none() {
+            PROCESSED_PODS_COUNTER
+                .with_label_values(&["unassigned_node"])
+                .inc();
             trace!(
                 pod = pod_name.as_str(),
-                "Pod not assigned to a node. Skipping"
+                "Pod not yet assigned to a node. Skipping"
             );
             return;
         }
@@ -388,19 +438,36 @@ impl RateLimitingController {
             // may need a backoff anyway (which would occur anyway if the container fails a few times).
             // Additionally, the pod's config may be corrupt or otherwise unable to start.  Leaving it
             // as a "released" pod may indefinitely block all other queued pods.
+            PROCESSED_PODS_COUNTER
+                .with_label_values(&["delete_pod"])
+                .inc();
             self.delete_pod(&pod);
         } else if ready || completed {
             // `deleting` do we care? just wait for completed
             // || "time expired?" -> handle in reconciler?
             // typically we'll get the `ready` event unless the pod fails or completes quickly
+            PROCESSED_PODS_COUNTER
+                .with_label_values(&["drop_pod"])
+                .inc();
             self.drop_pod(&pod);
         } else if scheduled {
+            PROCESSED_PODS_COUNTER
+                .with_label_values(&["enqueue_pod"])
+                .inc();
             self.enqueue_pod(pod);
         } else {
+            PROCESSED_PODS_COUNTER.with_label_values(&["unknown"]).inc();
             warn!(
                 pod = pod_name.as_str(),
                 "Entered empty else block unexpectedly"
             );
+        }
+
+        let mut data = self.data.lock().unwrap();
+        for (node, pods) in &data.nodes_to_pods {
+            PENDING_PODS_GAUGE
+                .with_label_values(&[node])
+                .set(pods.len() as i64);
         }
     }
 }
@@ -412,24 +479,6 @@ impl FromRequest for RateLimitingController {
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         ok(req.app_data::<RateLimitingController>().unwrap().clone())
-    }
-}
-
-#[derive(Deserialize)]
-pub struct PodReleasedQuery {
-    node: String,
-    pod: String,
-}
-
-#[get("/is_pod_released")]
-pub async fn is_pod_released(
-    controller: RateLimitingController,
-    query: web::Query<PodReleasedQuery>,
-) -> impl Responder {
-    if controller.is_pod_released(query.node.as_str(), query.pod.as_str()) {
-        HttpResponse::new(StatusCode::OK)
-    } else {
-        HttpResponse::new(StatusCode::LOCKED)
     }
 }
 

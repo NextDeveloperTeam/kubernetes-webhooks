@@ -1640,6 +1640,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kube-runtime",
+ "once_cell",
  "openssl",
  "prometheus",
  "serde",
