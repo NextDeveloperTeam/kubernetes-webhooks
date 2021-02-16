@@ -55,7 +55,11 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
         MUTATE_COUNTER
             .with_label_values(&["invalid_resource"])
             .inc();
-        warn!(id, ?resource_type, "Invalid resource type");
+        warn!(
+            id,
+            resource_type = resource_type.as_str(),
+            "Invalid resource type"
+        );
         return HttpResponse::UnprocessableEntity().finish();
     }
 
@@ -72,7 +76,11 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
         if let Some(app) = labels.get("app") {
             if app.starts_with("backend-service") {
                 MUTATE_COUNTER.with_label_values(&["skipped"]).inc();
-                debug!(id, ?app, "skipping app matching opt-out label");
+                debug!(
+                    id,
+                    app = app.as_str(),
+                    "skipping app matching opt-out label"
+                );
                 return allow_without_mutation_response(admission_request);
             }
         }
@@ -108,6 +116,12 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
     // Insert at position 0 so that it does not get inserted after networking sidecars like Istio
     // that would end up blocking network traffic (i.e. the call back to this service to check if
     // the pod is released).
+    //
+    // TODO: consider configuring a `reinvocationPolicy` that will move the init container to the first
+    // position if a later webhook injects a container in front of this during the first pass. Istio,
+    // at least currently, adds its init containers to the end so this works for now...
+    // Also consider a validating webhook implementation to warn/err if this condition is violated
+    // by yet another reinvocation of another webhook.
     pod.spec
         .as_mut()
         .unwrap()
@@ -271,12 +285,15 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging;
     use actix_web::{test, App};
     use serde_json::{json, Value};
     use std::collections::HashSet;
 
     #[actix_rt::test]
     async fn test_mutate() -> anyhow::Result<()> {
+        logging::init_logging();
+
         let json = json!({
             "apiVersion": "admission.k8s.io/v1",
             "kind": "AdmissionReview",

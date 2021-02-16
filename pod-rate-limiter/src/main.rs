@@ -1,19 +1,22 @@
-use actix_web::{get, middleware, post, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use crate::controller::RateLimitingController;
+use actix_web::http::StatusCode;
+use actix_web::{
+    get, middleware, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
+};
 use actix_web_prom::PrometheusMetrics;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use std::ffi::OsString;
+use serde::Deserialize;
 use std::path::Path;
-use tracing::Level;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace, warn};
-use tracing_subscriber::EnvFilter;
 
 mod controller;
+mod logging;
 mod mutating_webhook;
 
 #[actix_rt::main]
 async fn main() -> Result<(), ()> {
-    init_logging();
+    logging::init_logging();
 
     let prometheus = PrometheusMetrics::new("", Some("/metrics"), None);
     mutating_webhook::register_metrics(&prometheus.registry);
@@ -34,8 +37,8 @@ async fn main() -> Result<(), ()> {
             .service(health)
             .service(ready)
             .service(echo)
+            .service(is_pod_released)
             .service(mutating_webhook::mutate)
-            .service(controller::is_pod_released)
     })
     .bind("0.0.0.0:8080")
     .expect("Can not bind to 0.0.0.0:8080")
@@ -70,25 +73,6 @@ async fn main() -> Result<(), ()> {
     Ok(())
 }
 
-fn init_logging() {
-    let env_filter = match EnvFilter::try_from_default_env() {
-        Ok(filter) => filter,
-        Err(_) => EnvFilter::default()
-            .add_directive(Level::DEBUG.into())
-            .add_directive("hyper::proto=info".parse().unwrap())
-            .add_directive("hyper::client=info".parse().unwrap()),
-    };
-
-    let one = OsString::from("1");
-    match std::env::var_os("JSON_LOGGING") {
-        Some(var) if var == one => tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(env_filter)
-            .init(),
-        _ => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
-    }
-}
-
 #[get("/healthz")]
 async fn health(_: HttpRequest) -> impl Responder {
     HttpResponse::Ok().body("OK")
@@ -104,4 +88,22 @@ async fn echo(req: HttpRequest, req_body: String) -> impl Responder {
     println!("{:?}", req);
     println!("{}", req_body);
     HttpResponse::Ok().body(req_body)
+}
+
+#[get("/is_pod_released")]
+async fn is_pod_released(
+    controller: RateLimitingController,
+    query: web::Query<PodReleasedQuery>,
+) -> impl Responder {
+    if controller.is_pod_released(query.node.as_str(), query.pod.as_str()) {
+        HttpResponse::new(StatusCode::OK)
+    } else {
+        HttpResponse::new(StatusCode::LOCKED)
+    }
+}
+
+#[derive(Deserialize)]
+struct PodReleasedQuery {
+    node: String,
+    pod: String,
 }
