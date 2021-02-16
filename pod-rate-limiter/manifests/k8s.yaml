@@ -1,15 +1,13 @@
-# apiVersion: v1
-# kind: Namespace
-# metadata:
-#   labels:
-#     docker-proxy-webhook: disabled
-#   name: pod-rate-limiter
+ apiVersion: v1
+ kind: Namespace
+ metadata:
+   name: pod-rate-limiter
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: pod-rate-limiter-certificate
-  namespace: kube-system
+  namespace: pod-rate-limiter
 spec:
   secretName: pod-rate-limiter-certificate
   duration: 8760h # 365d
@@ -26,7 +24,7 @@ spec:
     - server auth
     - client auth
   dnsNames:
-    - pod-rate-limiter.kube-system.svc
+    - pod-rate-limiter.pod-rate-limiter.svc
   issuerRef:
     name: ca-cluster-issuer
     kind: ClusterIssuer
@@ -36,7 +34,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: pod-rate-limiter
-  namespace: kube-system
+  namespace: pod-rate-limiter
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -64,7 +62,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: pod-rate-limiter
-    namespace: kube-system
+    namespace: pod-rate-limiter
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -72,7 +70,7 @@ metadata:
   labels:
     app: pod-rate-limiter
   name: pod-rate-limiter
-  namespace: kube-system
+  namespace: pod-rate-limiter
 spec:
   replicas: 1
   selector:
@@ -101,7 +99,7 @@ spec:
               value: "FULL"
             - name: JSON_LOGGING
               value: "1"
-          image: 595477448247.dkr.ecr.us-west-2.amazonaws.com/nexttrucking/temp:pod-rate-limiter-35 #123456789012.dkr.ecr.us-east-1.amazonaws.com/registry/docker-proxy
+          image: 595477448247.dkr.ecr.us-west-2.amazonaws.com/nexttrucking/temp:pod-rate-limiter-39 #123456789012.dkr.ecr.us-east-1.amazonaws.com/nexttrucking/pod-rate-limiter
           # imagePullPolicy: Never # Always
           ports:
             - containerPort: 8080
@@ -142,7 +140,7 @@ metadata:
   labels:
     app: pod-rate-limiter
   name: pod-rate-limiter
-  namespace: kube-system
+  namespace: pod-rate-limiter
 spec:
   ports:
     - name: https
@@ -165,9 +163,9 @@ apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
   name: pod-rate-limiter
-  namespace: kube-system
+  namespace: pod-rate-limiter
   annotations:
-    cert-manager.io/inject-ca-from: kube-system/pod-rate-limiter-certificate
+    cert-manager.io/inject-ca-from: pod-rate-limiter/pod-rate-limiter-certificate
 webhooks:
   - name: pod-rate-limiter.nexttrucking.com
     namespaceSelector:
@@ -184,7 +182,7 @@ webhooks:
         scope:       "*"
     clientConfig:
       service:
-        namespace: kube-system
+        namespace: pod-rate-limiter
         name: pod-rate-limiter
         path: /mutate
         port: 443
@@ -199,7 +197,7 @@ webhooks:
    labels:
      app: pod-rate-limiter
    name: pod-rate-limiter
-   namespace: kube-system
+   namespace: pod-rate-limiter
  spec:
    endpoints:
    - port: metrics
@@ -208,4 +206,4 @@ webhooks:
        app: pod-rate-limiter
    namespaceSelector:
      matchNames:
-     - kube-system
+     - pod-rate-limiter
