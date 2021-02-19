@@ -30,14 +30,14 @@ async fn main() -> Result<(), ()> {
             .wrap(prometheus.clone()) // for now this must be first or we'll log calls to `/metrics` as a 404. Ref: https://github.com/nlopes/actix-web-prom/issues/39
             .wrap(
                 middleware::Logger::default()
-                    .exclude("/healthz")
                     .exclude("/readyz")
+                    .exclude("/livez")
                     .exclude("/metrics"),
             )
-            .service(health)
             .service(ready)
+            .service(live)
             .service(echo)
-            .service(is_pod_released)
+            .service(try_release_pod)
             .service(mutating_webhook::mutate)
     })
     .bind("0.0.0.0:8080")
@@ -73,14 +73,18 @@ async fn main() -> Result<(), ()> {
     Ok(())
 }
 
-#[get("/healthz")]
-async fn health(_: HttpRequest) -> impl Responder {
-    HttpResponse::Ok().body("OK")
-}
-
 #[get("/readyz")]
 async fn ready(_: HttpRequest) -> impl Responder {
     HttpResponse::Ok().body("OK")
+}
+
+#[get("/livez")]
+async fn live(controller: RateLimitingController) -> impl Responder {
+    if controller.live().await {
+        HttpResponse::Ok().body("OK")
+    } else {
+        HttpResponse::ServiceUnavailable().body("NOT OK")
+    }
 }
 
 #[post("/echo")]
@@ -90,12 +94,12 @@ async fn echo(req: HttpRequest, req_body: String) -> impl Responder {
     HttpResponse::Ok().body(req_body)
 }
 
-#[get("/is_pod_released")]
-async fn is_pod_released(
+#[get("/try_release_pod")]
+async fn try_release_pod(
     controller: RateLimitingController,
     query: web::Query<PodReleasedQuery>,
 ) -> impl Responder {
-    if controller.is_pod_released(query.node.as_str(), query.pod.as_str()) {
+    if controller.try_release_pod(query.node.as_str(), query.pod.as_str()) {
         HttpResponse::new(StatusCode::OK)
     } else {
         HttpResponse::new(StatusCode::LOCKED)

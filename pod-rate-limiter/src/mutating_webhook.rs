@@ -181,7 +181,7 @@ fn build_init_container() -> Container {
         "command": ["/bin/sh"],
         "args": [
             "-c",
-            "start=`date +%s`; elapsed=0; released=-1; until [ $released -eq 0 ] || [ $elapsed -ge 600 ]; do curl -m 5 -f --no-progress-meter http://pod-rate-limiter.pod-rate-limiter.svc.cluster.local/is_pod_released?pod=$POD_NAME\\&node=$NODE_NAME; released=$?; now=`date +%s`; elapsed=`expr $now - $start`; sleep 2; done; echo \"Released: $released, Elapsed: $elapsed\""
+            "start=`date +%s`; elapsed=0; released=-1; until [ $released -eq 0 ] || [ $elapsed -ge 600 ]; do curl -m 5 -f --no-progress-meter http://pod-rate-limiter.pod-rate-limiter.svc.cluster.local/try_release_pod?pod=$POD_NAME\\&node=$NODE_NAME; released=$?; now=`date +%s`; elapsed=`expr $now - $start`; sleep 2; done; echo \"Released: $released, Elapsed: $elapsed\""
         ],
         "name": "pod-rate-limiter-init",
         "image": "curlimages/curl",
