@@ -418,17 +418,50 @@ impl RateLimitingController {
         let pods = &mut pod_state.pods;
 
         // If the pod already exists in the queue, update with the latest state so that we
-        // do not reset its position.  Otherwise add the pod to the end of the queue.
+        // do not reset its position (unless it has restarted).  Otherwise add the pod to the end of the queue.
         match pods.iter().position(|p| Meta::name(p) == pod_name) {
             Some(i) => {
-                let patch = || {
-                    let current = serde_json::to_value(&pods[i]).unwrap();
-                    let new = serde_json::to_value(&pod).unwrap();
+                let stored_pod = &pods[i];
 
-                    format!("{:?}", json_patch::diff(&current, &new).0)
+                let build_restart_map = |p: &Pod| {
+                    p.status
+                        .as_ref()
+                        .unwrap()
+                        .container_statuses
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .map(|s| (s.name.clone(), s.restart_count))
+                        .collect::<HashMap<_, _>>()
                 };
-                trace!(patch = patch().as_str(), "Upsert diff");
-                pods[i] = pod
+
+                let stored_statuses = build_restart_map(stored_pod);
+                let new_statuses = build_restart_map(&pod);
+
+                let restarted = stored_statuses
+                    .iter()
+                    .any(|i| new_statuses.get(i.0).unwrap() != i.1);
+
+                let patch = || {
+                    let stored_json = serde_json::to_value(stored_pod).unwrap();
+                    let new_json = serde_json::to_value(&pod).unwrap();
+
+                    format!("{:?}", json_patch::diff(&stored_json, &new_json).0)
+                };
+                trace!(?restarted, patch = patch().as_str(), "Upsert diff");
+
+                if restarted {
+                    if pod_state.released_pod.is_some()
+                        && pod_state.released_pod.as_ref().unwrap() == &Meta::name(&pod)
+                    {
+                        pod_state.released_pod = None;
+                    }
+
+                    pods.remove(i);
+                    pods.push(pod);
+                } else {
+                    pods[i] = pod
+                }
             }
             None => pods.push(pod),
         }
