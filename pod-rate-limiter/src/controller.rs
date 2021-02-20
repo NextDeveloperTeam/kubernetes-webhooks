@@ -429,7 +429,7 @@ impl RateLimitingController {
                         .unwrap()
                         .container_statuses
                         .as_ref()
-                        .unwrap()
+                        .unwrap_or(&vec![])
                         .iter()
                         .map(|s| (s.name.clone(), s.restart_count))
                         .collect::<HashMap<_, _>>()

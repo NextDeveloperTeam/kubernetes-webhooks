@@ -99,7 +99,7 @@ spec:
               value: "FULL"
             - name: JSON_LOGGING
               value: "1"
-          image: 595477448247.dkr.ecr.us-west-2.amazonaws.com/nexttrucking/temp:pod-rate-limiter-42 #123456789012.dkr.ecr.us-east-1.amazonaws.com/nexttrucking/pod-rate-limiter
+          image: 595477448247.dkr.ecr.us-west-2.amazonaws.com/nexttrucking/temp:pod-rate-limiter-44 #123456789012.dkr.ecr.us-east-1.amazonaws.com/nexttrucking/pod-rate-limiter
           # imagePullPolicy: Never # Always
           ports:
             - containerPort: 8080
