@@ -1,4 +1,4 @@
-use actix_web::{post, web, HttpResponse};
+use actix_web::{post, web, Either, HttpResponse};
 use k8s_openapi::api::authentication::v1::UserInfo;
 use k8s_openapi::api::core::v1::{Container, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
@@ -19,52 +19,95 @@ static MUTATE_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+static VALIDATE_COUNTER: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "pod_rate_limiter_validate_total",
+            "Total calls to 'validate'"
+        ),
+        &["result"],
+    )
+    .unwrap()
+});
+
+#[post("/validate")]
+pub async fn validate(admission_request: web::Json<Request>) -> HttpResponse {
+    trace!(
+        request = ?admission_request.0,
+        "validate admission request"
+    );
+
+    let either = extract_pod(&admission_request.request);
+
+    let pod = match either {
+        Either::A(pod) => pod,
+        Either::B(response) => return response,
+    };
+
+    let id = admission_request.request.uid.as_str();
+
+    let init_pos = pod
+        .spec
+        .as_ref()
+        .unwrap()
+        .init_containers
+        .as_ref()
+        .unwrap()
+        .iter()
+        .position(|p| p.name == "pod-rate-limiter-init");
+
+    match init_pos {
+        Some(i) => {
+            if i != 0 {
+                VALIDATE_COUNTER
+                    .with_label_values(&["init_container_wrong_position"])
+                    .inc();
+            } else {
+                // If pos==1, it's in the right place. Next validate the label.
+                if !pod.metadata.labels.is_some()
+                    || pod
+                        .metadata
+                        .labels
+                        .unwrap()
+                        .iter()
+                        .find(|(k, v)| k.as_str() == "pod-rate-limiter" && v.as_str() == "enabled")
+                        .is_none()
+                {
+                    VALIDATE_COUNTER
+                        .with_label_values(&["init_label_missing"])
+                        .inc();
+                }
+            }
+        }
+        None => VALIDATE_COUNTER
+            .with_label_values(&["init_container_missing"])
+            .inc(),
+    }
+
+    let admission_response = Response::new(AdmissionResponse {
+        uid: id.to_string(),
+        allowed: true,
+        ..Default::default()
+    });
+
+    HttpResponse::Ok().json(admission_response)
+}
+
 #[post("/mutate")]
 pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
     trace!(
         request = ?admission_request.0,
-        "admission request"
+        "mutate admission request"
     );
 
-    if !admission_request.request.resource.is_some()
-        || !admission_request
-            .request
-            .resource
-            .as_ref()
-            .unwrap()
-            .resource
-            .is_some()
-    {
-        MUTATE_COUNTER.with_label_values(&["invalid_input"]).inc();
-        warn!("Malformed admission request");
-        return HttpResponse::UnprocessableEntity().finish();
-    }
+    let either = extract_pod(&admission_request.request);
+
+    let mut pod = match either {
+        Either::A(pod) => pod,
+        Either::B(response) => return response,
+    };
 
     let id = admission_request.request.uid.as_str();
-
-    let resource_type = admission_request
-        .request
-        .resource
-        .as_ref()
-        .unwrap()
-        .resource
-        .as_ref()
-        .unwrap();
-
-    if resource_type != "pods" {
-        MUTATE_COUNTER
-            .with_label_values(&["invalid_resource"])
-            .inc();
-        warn!(
-            id,
-            resource_type = resource_type.as_str(),
-            "Invalid resource type"
-        );
-        return HttpResponse::UnprocessableEntity().finish();
-    }
-
-    let mut pod: Pod =
-        serde_json::from_value(admission_request.request.object.clone().unwrap().0).unwrap();
 
     let pod_name = match pod.metadata.name.as_ref() {
         Some(name) => name,
@@ -90,7 +133,7 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
         pod.spec.as_mut().unwrap().init_containers = Some(Vec::with_capacity(1))
     }
 
-    if pod
+    let existing_pod_position = pod
         .spec
         .as_ref()
         .unwrap()
@@ -98,44 +141,59 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
         .as_ref()
         .unwrap()
         .iter()
-        .find(|c| c.name == "pod-rate-limiter-init")
-        .is_some()
-    {
+        .position(|c| c.name == "pod-rate-limiter-init");
+
+    if existing_pod_position.is_some() {
+        if existing_pod_position.unwrap() == 0 {
+            debug!(
+                id,
+                pod = pod_name.as_str(),
+                "Pod already has the init container and it's in the first position."
+            );
+            MUTATE_COUNTER.with_label_values(&["reinvoked_noop"]).inc();
+            return allow_without_mutation_response(admission_request);
+        } else {
+            debug!(
+                id,
+                pod = pod_name.as_str(),
+                "Pod already has the init container, but in the wrong position. Moving to the first slot."
+            );
+
+            MUTATE_COUNTER
+                .with_label_values(&["reinvoked_move_to_front"])
+                .inc();
+
+            let init_containers = pod.spec.as_mut().unwrap().init_containers.as_mut().unwrap();
+            let existing_init_container = init_containers.remove(existing_pod_position.unwrap());
+            init_containers.insert(0, existing_init_container);
+        }
+    } else {
+        // Create and insert rate limiting init container.
+        // Insert at position 0 so that it does not get inserted after networking sidecars like Istio
+        // that would end up blocking network traffic (i.e. the call back to this service to check if
+        // the pod is released).
+        pod.spec
+            .as_mut()
+            .unwrap()
+            .init_containers
+            .as_mut()
+            .unwrap()
+            .insert(0, build_init_container());
+
+        // Add label for filtering by the k8s watcher in `controller`
+        pod.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("pod-rate-limiter".to_string(), "enabled".to_string());
+
         debug!(
             id,
             pod = pod_name.as_str(),
-            "Pod already has the init container. Skipping"
+            "Injected init container into pod."
         );
-        MUTATE_COUNTER
-            .with_label_values(&["already_processed"])
-            .inc();
-        return allow_without_mutation_response(admission_request);
+        MUTATE_COUNTER.with_label_values(&["mutated"]).inc();
     }
-
-    // Create and insert rate limiting init container.
-    // Insert at position 0 so that it does not get inserted after networking sidecars like Istio
-    // that would end up blocking network traffic (i.e. the call back to this service to check if
-    // the pod is released).
-    //
-    // TODO: consider configuring a `reinvocationPolicy` that will move the init container to the first
-    // position if a later webhook injects a container in front of this during the first pass. Istio,
-    // at least currently, adds its init containers to the end so this works for now...
-    // Also consider a validating webhook implementation to warn/err if this condition is violated
-    // by yet another reinvocation of another webhook.
-    pod.spec
-        .as_mut()
-        .unwrap()
-        .init_containers
-        .as_mut()
-        .unwrap()
-        .insert(0, build_init_container());
-
-    // Add label for filtering by the k8s watcher in `controller`
-    pod.metadata
-        .labels
-        .as_mut()
-        .unwrap()
-        .insert("pod-rate-limiter".to_string(), "enabled".to_string());
 
     // generate a patch for the init container if needed
     let patches = json_patch::diff(
@@ -144,18 +202,12 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
     );
 
     let admission_response = Response::new(AdmissionResponse {
-        uid: admission_request.request.uid.to_string(),
+        uid: id.to_string(),
         allowed: true,
         patch: Some(base64::encode(serde_json::to_string(&patches).unwrap())),
         patch_type: Some("JSONPatch".to_string()),
         ..Default::default()
     });
-
-    debug!(
-        id,
-        pod = pod_name.as_str(),
-        "Injected init container into pod."
-    );
 
     trace!(
         id,
@@ -164,8 +216,41 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
         "Admission Response."
     );
 
-    MUTATE_COUNTER.with_label_values(&["mutated"]).inc();
     HttpResponse::Ok().json(admission_response)
+}
+
+fn extract_pod(request: &AdmissionRequest) -> Either<Pod, HttpResponse> {
+    if !request.resource.is_some() || !request.resource.as_ref().unwrap().resource.is_some() {
+        MUTATE_COUNTER.with_label_values(&["invalid_input"]).inc();
+        warn!("Malformed admission request");
+        return Either::B(HttpResponse::UnprocessableEntity().finish());
+    }
+
+    let id = request.uid.as_str();
+
+    let resource_type = request
+        .resource
+        .as_ref()
+        .unwrap()
+        .resource
+        .as_ref()
+        .unwrap();
+
+    if resource_type != "pods" {
+        MUTATE_COUNTER
+            .with_label_values(&["invalid_resource"])
+            .inc();
+        warn!(
+            id,
+            resource_type = resource_type.as_str(),
+            "Invalid resource type"
+        );
+        return Either::B(HttpResponse::UnprocessableEntity().finish());
+    }
+
+    let pod: Pod = serde_json::from_value(request.object.clone().unwrap().0).unwrap();
+
+    return Either::A(pod);
 }
 
 fn allow_without_mutation_response(admission_request: web::Json<Request>) -> HttpResponse {

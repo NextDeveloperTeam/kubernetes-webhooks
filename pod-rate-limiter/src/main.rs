@@ -39,6 +39,7 @@ async fn main() -> Result<(), ()> {
             .service(echo)
             .service(try_release_pod)
             .service(mutating_webhook::mutate)
+            .service(mutating_webhook::validate)
     })
     .bind("0.0.0.0:8080")
     .expect("Can not bind to 0.0.0.0:8080")
