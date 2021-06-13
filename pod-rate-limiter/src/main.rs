@@ -1,11 +1,7 @@
 use crate::controller::RateLimitingController;
-use actix_web::http::StatusCode;
-use actix_web::{
-    get, middleware, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
-};
+use actix_web::{get, middleware, post, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_prom::PrometheusMetrics;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use serde::Deserialize;
 use std::path::Path;
 #[allow(unused_imports)]
 use tracing::{debug, error, info, trace, warn};
@@ -37,7 +33,7 @@ async fn main() -> Result<(), ()> {
             .service(ready)
             .service(live)
             .service(echo)
-            .service(try_release_pod)
+            .service(controller::try_release_pod)
             .service(mutating_webhook::mutate)
             .service(mutating_webhook::validate)
     })
@@ -93,22 +89,4 @@ async fn echo(req: HttpRequest, req_body: String) -> impl Responder {
     println!("{:?}", req);
     println!("{}", req_body);
     HttpResponse::Ok().body(req_body)
-}
-
-#[get("/try_release_pod")]
-async fn try_release_pod(
-    controller: RateLimitingController,
-    query: web::Query<PodReleasedQuery>,
-) -> impl Responder {
-    if controller.try_release_pod(query.node.as_str(), query.pod.as_str()) {
-        HttpResponse::new(StatusCode::OK)
-    } else {
-        HttpResponse::new(StatusCode::LOCKED)
-    }
-}
-
-#[derive(Deserialize)]
-struct PodReleasedQuery {
-    node: String,
-    pod: String,
 }

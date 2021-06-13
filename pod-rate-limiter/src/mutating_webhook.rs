@@ -46,42 +46,55 @@ pub async fn validate(admission_request: web::Json<Request>) -> HttpResponse {
 
     let id = admission_request.request.uid.as_str();
 
-    let init_pos = pod
-        .spec
-        .as_ref()
-        .unwrap()
-        .init_containers
-        .as_ref()
-        .unwrap()
-        .iter()
-        .position(|p| p.name == "pod-rate-limiter-init");
+    if pod.metadata.labels.is_some()
+        && pod
+            .metadata
+            .labels
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|x| x.0 == "pod-rate-limiter" && x.1 == "enabled")
+    {
+        let init_pos = pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|p| p.name == "pod-rate-limiter-init");
 
-    match init_pos {
-        Some(i) => {
-            if i != 0 {
-                VALIDATE_COUNTER
-                    .with_label_values(&["init_container_wrong_position"])
-                    .inc();
-            } else {
-                // If pos==1, it's in the right place. Next validate the label.
-                if !pod.metadata.labels.is_some()
-                    || pod
-                        .metadata
-                        .labels
-                        .unwrap()
-                        .iter()
-                        .find(|(k, v)| k.as_str() == "pod-rate-limiter" && v.as_str() == "enabled")
-                        .is_none()
-                {
+        match init_pos {
+            Some(i) => {
+                if i != 0 {
                     VALIDATE_COUNTER
-                        .with_label_values(&["init_label_missing"])
+                        .with_label_values(&["init_container_wrong_position"])
                         .inc();
+                } else {
+                    // If pos==1, it's in the right place. Next validate the label.
+                    if !pod.metadata.labels.is_some()
+                        || pod
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .find(|(k, v)| {
+                                k.as_str() == "pod-rate-limiter" && v.as_str() == "enabled"
+                            })
+                            .is_none()
+                    {
+                        VALIDATE_COUNTER
+                            .with_label_values(&["init_label_missing"])
+                            .inc();
+                    }
                 }
             }
+            None => VALIDATE_COUNTER
+                .with_label_values(&["init_container_missing"])
+                .inc(),
         }
-        None => VALIDATE_COUNTER
-            .with_label_values(&["init_container_missing"])
-            .inc(),
     }
 
     let admission_response = Response::new(AdmissionResponse {
@@ -145,7 +158,7 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
 
     if existing_pod_position.is_some() {
         if existing_pod_position.unwrap() == 0 {
-            debug!(
+            trace!(
                 id,
                 pod = pod_name.as_str(),
                 "Pod already has the init container and it's in the first position."
@@ -178,7 +191,7 @@ pub async fn mutate(admission_request: web::Json<Request>) -> HttpResponse {
             .init_containers
             .as_mut()
             .unwrap()
-            .insert(0, build_init_container());
+            .insert(0, build_init_container(None));
 
         // Add label for filtering by the k8s watcher in `controller`
         pod.metadata
@@ -261,12 +274,17 @@ fn allow_without_mutation_response(admission_request: web::Json<Request>) -> Htt
     }))
 }
 
-fn build_init_container() -> Container {
+pub fn build_init_container(uri_authority: Option<&str>) -> Container {
+    let authority = match uri_authority {
+        Some(h) => h,
+        None => "pod-rate-limiter.pod-rate-limiter.svc.cluster.local",
+    };
+
     serde_json::from_value(json!({
         "command": ["/bin/sh"],
         "args": [
             "-c",
-            "start=`date +%s`; elapsed=0; released=-1; until [ $released -eq 0 ] || [ $elapsed -ge 600 ]; do curl -m 5 -f --no-progress-meter http://pod-rate-limiter.pod-rate-limiter.svc.cluster.local/try_release_pod?pod=$POD_NAME\\&node=$NODE_NAME; released=$?; now=`date +%s`; elapsed=`expr $now - $start`; sleep 2; done; echo \"Released: $released, Elapsed: $elapsed\""
+            format!("start=`date +%s`; elapsed=0; released=-1; until [ $released -eq 0 ] || [ $elapsed -ge 600 ]; do curl -m 5 -f --no-progress-meter http://{}/try_release_pod?pod=$POD_NAME\\&node=$NODE_NAME; released=$?; now=`date +%s`; elapsed=`expr $now - $start`; sleep 2; done; echo \"Released: $released, Elapsed: $elapsed\"", authority)
         ],
         "name": "pod-rate-limiter-init",
         "image": "curlimages/curl",
