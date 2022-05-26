@@ -57,7 +57,9 @@ func main() {
 
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	if _, exists := os.LookupEnv("KUBERNETES_SERVICE_HOST"); !exists {
+		ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
