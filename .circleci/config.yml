@@ -9,7 +9,7 @@ jobs:
       - image: circleci/golang:1.15
     steps:
       - setup_remote_docker:
-          version: 20.10.11
+          version: default
       - checkout
       - aws-cli/setup
       - run:
