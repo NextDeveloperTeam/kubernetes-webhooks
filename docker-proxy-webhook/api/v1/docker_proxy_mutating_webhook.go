@@ -37,9 +37,10 @@ type DockerConfig struct {
 }
 
 type DockerProxyMutatingWebhook struct {
-	Client  client.Client
-	decoder *admission.Decoder
-	config  DockerConfig
+	Client     client.Client
+	PullSecret string
+	decoder    *admission.Decoder
+	config     DockerConfig
 }
 
 var (
@@ -81,7 +82,7 @@ func init() {
 	metrics.Registry.MustRegister(webhookResultCounter, webhookFailureCounter, containerRewriteCounter, unknownDomainCounter)
 }
 
-func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.Client) (*DockerProxyMutatingWebhook, error) {
+func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.Client, pullSecret string) (*DockerProxyMutatingWebhook, error) {
 	config := DockerConfig{}
 	err := yaml.Unmarshal(mutatingWebhookConfig, &config)
 	if err != nil {
@@ -107,7 +108,7 @@ func NewDockerProxyMutatingWebhook(mutatingWebhookConfig []byte, client client.C
 		log.V(1).Info("Ignore list empty")
 	}
 
-	return &DockerProxyMutatingWebhook{config: config, Client: client}, nil
+	return &DockerProxyMutatingWebhook{config: config, Client: client, PullSecret: pullSecret}, nil
 }
 
 // TODO: add _validating_ webhook to catch cases where the order of operations leads to non-conforming request
@@ -158,9 +159,9 @@ func (webhook *DockerProxyMutatingWebhook) Handle(ctx context.Context, req admis
 		}
 	}
 
-	if changed {
+	if changed && webhook.PullSecret != "" {
 		pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
-			{Name: "docker-proxy-credentials"},
+			{Name: webhook.PullSecret},
 		}
 	}
 
