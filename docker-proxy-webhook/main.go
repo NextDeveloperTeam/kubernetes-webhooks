@@ -3,7 +3,9 @@ Copyright 2020 NEXT Trucking.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -43,11 +45,12 @@ func init() {
 }
 
 func main() {
-	var metricsAddr, healthAddr string
+	var metricsAddr, healthAddr, pullSecret string
 	var port int
 
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&healthAddr, "health-addr", ":8081", "The address the health endpoint binds to.")
+	flag.StringVar(&pullSecret, "pull-secret", "docker-proxy-credentials", "Include a pull secret in the pod configuration if the image reference has been rewritten.")
 	flag.IntVar(&port, "listen-port", 9443, "The port the webhook endpoint binds to.")
 
 	//var enableLeaderElection bool	// disabled since we're just a webhook and not a controller
@@ -87,7 +90,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	addMutatingWebhook(err, mgr)
+	addMutatingWebhook(err, mgr, pullSecret)
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
@@ -96,7 +99,7 @@ func main() {
 	}
 }
 
-func addMutatingWebhook(err error, mgr manager.Manager) {
+func addMutatingWebhook(err error, mgr manager.Manager, pullSecret string) {
 	hookServer := mgr.GetWebhookServer()
 
 	configPath := "/tmp/config/docker-proxy-config.yaml"
@@ -106,7 +109,7 @@ func addMutatingWebhook(err error, mgr manager.Manager) {
 		os.Exit(1)
 	}
 
-	hook, err := v1.NewDockerProxyMutatingWebhook(configBytes, mgr.GetClient())
+	hook, err := v1.NewDockerProxyMutatingWebhook(configBytes, mgr.GetClient(), pullSecret)
 	if err != nil {
 		setupLog.Error(err, "Failed to create webhook")
 		os.Exit(1)
