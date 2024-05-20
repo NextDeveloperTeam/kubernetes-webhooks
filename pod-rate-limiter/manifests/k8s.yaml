@@ -1,0 +1,240 @@
+ apiVersion: v1
+ kind: Namespace
+ metadata:
+   name: pod-rate-limiter
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pod-rate-limiter-certificate
+  namespace: pod-rate-limiter
+spec:
+  secretName: pod-rate-limiter-certificate
+  duration: 8760h # 365d
+  renewBefore: 360h # 15d
+  subject:
+    organizations:
+      - nexttrucking
+  isCA: false
+  privateKey:
+    size: 2048
+    algorithm: RSA
+    encoding: PKCS8
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - pod-rate-limiter.pod-rate-limiter.svc
+  issuerRef:
+    name: ca-cluster-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-rate-limiter
+  namespace: pod-rate-limiter
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-rate-limiter
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+      - delete
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: pod-rate-limiter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-rate-limiter
+subjects:
+  - kind: ServiceAccount
+    name: pod-rate-limiter
+    namespace: pod-rate-limiter
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: pod-rate-limiter
+  name: pod-rate-limiter
+  namespace: pod-rate-limiter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pod-rate-limiter
+  template:
+    metadata:
+      labels:
+        app: pod-rate-limiter
+    spec:
+      affinity:
+        podAntiAffinity:
+          # do not schedule on the same node to avoid `hostNetwork` port conflicts
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: "kubernetes.io/hostname"
+            labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - pod-rate-limiter
+      containers:
+        - name: pod-rate-limiter
+          env:
+            - name: RUST_BACKTRACE
+              value: "FULL"
+            - name: JSON_LOGGING
+              value: "1"
+          image: 595477448247.dkr.ecr.us-west-2.amazonaws.com/nexttrucking/temp:pod-rate-limiter-47 #123456789012.dkr.ecr.us-east-1.amazonaws.com/nexttrucking/pod-rate-limiter
+          # imagePullPolicy: Never # Always
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+              name: http
+            - containerPort: 8443
+              protocol: TCP
+              name: https
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            successThreshold: 1
+            failureThreshold: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - mountPath: /tmp/k8s-webhook-server/serving-certs
+              name: cert
+              readOnly: true
+      hostNetwork: true
+      serviceAccountName: pod-rate-limiter
+      volumes:
+        - name: cert
+          secret:
+            defaultMode: 420
+            secretName: pod-rate-limiter-certificate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: pod-rate-limiter
+  name: pod-rate-limiter
+  namespace: pod-rate-limiter
+spec:
+  ports:
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: https
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+    - name: metrics
+      port: 8080
+      protocol: TCP
+      targetPort: http
+  selector:
+    app: pod-rate-limiter
+  type: ClusterIP
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: pod-rate-limiter
+  namespace: pod-rate-limiter
+  annotations:
+    cert-manager.io/inject-ca-from: pod-rate-limiter/pod-rate-limiter-certificate
+webhooks:
+  - name: pod-rate-limiter.nexttrucking.com
+    namespaceSelector:
+      matchExpressions:
+        - key: pod-rate-limiter
+          operator: In
+          values:
+            - enabled
+    rules:
+      - apiGroups:   [""]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["pods"]
+        scope:       "*"
+    clientConfig:
+      service:
+        namespace: pod-rate-limiter
+        name: pod-rate-limiter
+        path: /mutate
+        port: 443
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    matchPolicy: Equivalent
+    reinvocationPolicy: IfNeeded
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: pod-rate-limiter
+  namespace: pod-rate-limiter
+  annotations:
+    cert-manager.io/inject-ca-from: pod-rate-limiter/pod-rate-limiter-certificate
+webhooks:
+  - name: pod-rate-limiter.nexttrucking.com
+    namespaceSelector:
+      matchExpressions:
+        - key: pod-rate-limiter
+          operator: In
+          values:
+            - enabled
+    rules:
+      - apiGroups:   [""]
+        apiVersions: ["v1"]
+        operations:  ["CREATE"]
+        resources:   ["pods"]
+        scope:       "*"
+    clientConfig:
+      service:
+        namespace: pod-rate-limiter
+        name: pod-rate-limiter
+        path: /validate
+        port: 443
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    matchPolicy: Equivalent
+---
+ apiVersion: monitoring.coreos.com/v1
+ kind: ServiceMonitor
+ metadata:
+   labels:
+     app: pod-rate-limiter
+   name: pod-rate-limiter
+   namespace: pod-rate-limiter
+ spec:
+   endpoints:
+   - port: metrics
+   selector:
+     matchLabels:
+       app: pod-rate-limiter
+   namespaceSelector:
+     matchNames:
+     - pod-rate-limiter
